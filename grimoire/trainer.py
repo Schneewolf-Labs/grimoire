@@ -346,24 +346,29 @@ class GrimoireTrainer:
 
         lr = self.config.learning_rate
 
-        if self.config.optimizer == "adamw":
+        opt = self.config.optimizer
+
+        if opt in ("adamw", "adamw_torch", "adamw_hf"):
             kwargs = {}
             if torch.cuda.is_available():
                 kwargs["fused"] = True
             return torch.optim.AdamW(param_groups, lr=lr, **kwargs)
-        elif self.config.optimizer in ("adamw_8bit", "adamw_bnb_8bit"):
+        elif opt in ("adamw_8bit", "adamw_bnb_8bit"):
             import bitsandbytes as bnb
             return bnb.optim.AdamW8bit(param_groups, lr=lr)
-        elif self.config.optimizer in ("paged_adamw_8bit",):
+        elif opt == "paged_adamw_8bit":
             import bitsandbytes as bnb
             return bnb.optim.PagedAdamW8bit(param_groups, lr=lr)
-        elif self.config.optimizer in ("paged_adamw_32bit",):
+        elif opt in ("paged_adamw_32bit", "paged_adamw"):
             import bitsandbytes as bnb
             return bnb.optim.PagedAdamW32bit(param_groups, lr=lr)
-        elif self.config.optimizer == "sgd":
+        elif opt == "adafactor":
+            from transformers.optimization import Adafactor
+            return Adafactor(param_groups, lr=lr, relative_step=False, scale_parameter=False)
+        elif opt == "sgd":
             return torch.optim.SGD(param_groups, lr=lr, momentum=0.9)
         else:
-            raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
+            raise ValueError(f"Unknown optimizer: {opt}")
 
     def _save_checkpoint(self):
         checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{self.global_step}")
