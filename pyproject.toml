@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grimoire"
+version = "0.1.0"
+description = "Simple, multi-GPU LLM fine-tuning library"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.36.0",
+    "accelerate>=0.24.0",
+    "peft>=0.6.0",
+    "datasets>=2.14.0",
+]
+
+[project.optional-dependencies]
+quantization = ["bitsandbytes>=0.41.0"]
+logging = ["wandb>=0.15.0"]
+dev = ["pytest>=7.0", "ruff>=0.1.0"]
+all = ["grimoire[quantization,logging,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["grimoire*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
