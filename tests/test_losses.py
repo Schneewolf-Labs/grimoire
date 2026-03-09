@@ -1,4 +1,4 @@
-"""Tests for SFT, ORPO, DPO, and SimPO loss functions."""
+"""Tests for SFT, ORPO, DPO, SimPO, and KTO loss functions."""
 
 import copy
 
@@ -9,6 +9,7 @@ from grimoire.losses.sft import SFTLoss
 from grimoire.losses.orpo import ORPOLoss, _pad_dim1
 from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.simpo import SimPOLoss
+from grimoire.losses.kto import KTOLoss
 
 
 class SimpleModel(nn.Module):
@@ -416,3 +417,132 @@ class TestSimPOLoss:
         """SimPO should work without any reference model."""
         loss_fn = SimPOLoss()
         assert not hasattr(loss_fn, "ref_model")
+
+
+def _make_kto_batch(vocab_size=32, seq_len=8, batch_size=4, prompt_len=2, desirable_ratio=0.5):
+    """Helper to create a KTO batch with mixed desirable/undesirable examples."""
+    n_desirable = int(batch_size * desirable_ratio)
+    batch = {
+        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
+        "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
+        "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+        "kto_label": torch.zeros(batch_size, dtype=torch.bool),
+    }
+    batch["labels"][:, :prompt_len] = -100
+    batch["kto_label"][:n_desirable] = True
+    return batch
+
+
+class TestKTOLoss:
+    def _make_loss(self, ref_model=None, beta=0.1, lambda_d=1.0, lambda_u=1.0):
+        model = SimpleModel()
+        if ref_model is None:
+            ref_model = copy.deepcopy(model)
+            ref_model.eval()
+        loss_fn = KTOLoss(ref_model=ref_model, beta=beta, lambda_d=lambda_d, lambda_u=lambda_u)
+        loss_fn._pad_token_id = 0
+        return model, loss_fn
+
+    def test_returns_scalar_loss_and_metrics(self):
+        model, loss_fn = self._make_loss()
+        batch = _make_kto_batch()
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert "chosen_rewards" in metrics
+        assert "rejected_rewards" in metrics
+        assert "reward_margin" in metrics
+        assert "reward_accuracy" in metrics
+        assert "kl_ref" in metrics
+
+    def test_eval_mode_uses_nll(self):
+        model, loss_fn = self._make_loss()
+        batch = _make_kto_batch()
+
+        loss, metrics = loss_fn(model, batch, training=False)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert metrics == {}
+
+    def test_beta_scales_loss(self):
+        torch.manual_seed(42)
+        ref_model = SimpleModel()
+        ref_model.eval()
+        policy = SimpleModel()
+        batch = _make_kto_batch()
+
+        loss_fn_low = KTOLoss(ref_model=ref_model, beta=0.01)
+        loss_fn_low._pad_token_id = 0
+        loss_fn_high = KTOLoss(ref_model=ref_model, beta=1.0)
+        loss_fn_high._pad_token_id = 0
+
+        loss_low, _ = loss_fn_low(policy, batch, training=True)
+        loss_high, _ = loss_fn_high(policy, batch, training=True)
+
+        assert loss_low.item() != loss_high.item()
+
+    def test_all_desirable_batch(self):
+        """Batch with only desirable examples should not crash."""
+        model, loss_fn = self._make_loss()
+        batch = _make_kto_batch(desirable_ratio=1.0)
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_all_undesirable_batch(self):
+        """Batch with only undesirable examples should not crash."""
+        model, loss_fn = self._make_loss()
+        batch = _make_kto_batch(desirable_ratio=0.0)
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_lambda_weighting(self):
+        """Higher lambda_u should increase loss from undesirable examples."""
+        torch.manual_seed(42)
+        ref_model = SimpleModel()
+        ref_model.eval()
+        policy = SimpleModel()
+        batch = _make_kto_batch(desirable_ratio=0.0)  # all undesirable
+
+        loss_fn_low = KTOLoss(ref_model=ref_model, beta=0.1, lambda_u=0.1)
+        loss_fn_low._pad_token_id = 0
+        loss_fn_high = KTOLoss(ref_model=ref_model, beta=0.1, lambda_u=5.0)
+        loss_fn_high._pad_token_id = 0
+
+        loss_low, _ = loss_fn_low(policy, batch, training=True)
+        loss_high, _ = loss_fn_high(policy, batch, training=True)
+
+        assert loss_high.item() > loss_low.item()
+
+    def test_ref_model_affects_loss(self):
+        """Changing the reference model should change the loss."""
+        torch.manual_seed(42)
+        policy = SimpleModel()
+        batch = _make_kto_batch()
+
+        ref_same = copy.deepcopy(policy)
+        ref_same.eval()
+        loss_fn_same = KTOLoss(ref_model=ref_same, beta=0.1)
+        loss_fn_same._pad_token_id = 0
+        loss_same, _ = loss_fn_same(policy, batch, training=True)
+
+        torch.manual_seed(999)
+        ref_diff = SimpleModel()
+        ref_diff.eval()
+        loss_fn_diff = KTOLoss(ref_model=ref_diff, beta=0.1)
+        loss_fn_diff._pad_token_id = 0
+        loss_diff, _ = loss_fn_diff(policy, batch, training=True)
+
+        assert loss_same.item() != loss_diff.item()
+
+    def test_creates_correct_collator(self):
+        ref_model = SimpleModel()
+        loss_fn = KTOLoss(ref_model=ref_model)
+        from grimoire.data.kto import KTOCollator
+        collator = loss_fn.create_collator(pad_token_id=0)
+        assert isinstance(collator, KTOCollator)

@@ -4,6 +4,7 @@ import torch
 import pytest
 from grimoire.data.sft import SFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
+from grimoire.data.kto import KTOCollator, tokenize_kto
 
 
 class TestSFTCollator:
@@ -130,3 +131,75 @@ class TestTokenizePreference:
         # Response tokens should be kept
         assert result["chosen_labels"][2:] == [ord("C"), ord("D")]
         assert result["rejected_labels"][2:] == [ord("E"), ord("F")]
+
+
+class TestKTOCollator:
+    def test_pads_to_max_length_and_preserves_label(self):
+        collator = KTOCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [-100, 2, 3], "kto_label": True},
+            {"input_ids": [4, 5], "attention_mask": [1, 1], "labels": [-100, 5], "kto_label": False},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (2, 3)
+        assert batch["attention_mask"].shape == (2, 3)
+        assert batch["labels"].shape == (2, 3)
+        assert batch["kto_label"].tolist() == [True, False]
+
+        # Second sequence should be padded
+        assert batch["input_ids"][1].tolist() == [4, 5, 0]
+        assert batch["attention_mask"][1].tolist() == [1, 1, 0]
+        assert batch["labels"][1].tolist() == [-100, 5, -100]
+
+    def test_single_element_batch(self):
+        collator = KTOCollator(pad_token_id=0)
+        features = [{"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2], "kto_label": True}]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (1, 2)
+        assert batch["kto_label"].tolist() == [True]
+
+    def test_equal_lengths_no_padding(self):
+        collator = KTOCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3], "kto_label": True},
+            {"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1], "labels": [4, 5, 6], "kto_label": False},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (2, 3)
+        assert (batch["attention_mask"] == 1).all()
+
+
+class TestTokenizeKTO:
+    @pytest.fixture
+    def mock_tokenizer(self):
+        class MockTokenizer:
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return MockTokenizer()
+
+    def test_produces_correct_keys(self, mock_tokenizer):
+        example = {"prompt": "AB", "response": "CD", "label": True}
+        result = tokenize_kto(example, mock_tokenizer)
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert "labels" in result
+        assert "kto_label" in result
+
+    def test_prompt_masked_in_labels(self, mock_tokenizer):
+        example = {"prompt": "AB", "response": "CD", "label": True}
+        result = tokenize_kto(example, mock_tokenizer)
+
+        assert result["labels"][:2] == [-100, -100]
+        assert result["labels"][2:] == [ord("C"), ord("D")]
+
+    def test_preserves_label(self, mock_tokenizer):
+        desirable = {"prompt": "Q", "response": "A", "label": True}
+        undesirable = {"prompt": "Q", "response": "A", "label": False}
+
+        assert tokenize_kto(desirable, mock_tokenizer)["kto_label"] is True
+        assert tokenize_kto(undesirable, mock_tokenizer)["kto_label"] is False
