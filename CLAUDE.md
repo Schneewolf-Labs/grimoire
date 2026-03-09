@@ -24,10 +24,11 @@ grimoire/
 ├── losses/
 │   ├── sft.py         # SFT loss (NLL on target tokens)
 │   ├── orpo.py        # ORPO loss (SFT + odds ratio)
-│   └── dpo.py         # DPO loss (reference model + preference)
+│   ├── dpo.py         # DPO loss (reference model + preference)
+│   └── simpo.py       # SimPO loss (reference-free + reward margin)
 └── data/
     ├── sft.py         # SFT collator + tokenization
-    └── preference.py  # Preference collator + tokenization (ORPO/DPO)
+    └── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO)
 ```
 
 ## Key Design Decisions
@@ -37,15 +38,16 @@ grimoire/
 - Loss functions own their data collators via `create_collator(pad_token_id)`
 - Multi-GPU, DeepSpeed, FSDP work out of the box via `accelerate config`
 - Gradient checkpointing with `use_reentrant=False` for DDP/FSDP compatibility
-- Single concatenated forward pass for ORPO/DPO (chosen + rejected in one call)
-- Average log probabilities for ORPO/DPO stability across varying response lengths
+- Single concatenated forward pass for ORPO/DPO/SimPO (chosen + rejected in one call)
+- Average log probabilities for ORPO/DPO/SimPO stability across varying response lengths
 - DPO uses a frozen reference model passed to the loss function (caller manages lifecycle)
+- SimPO is reference-free like ORPO but uses only a margin-based preference loss (no NLL term)
 
 ## Usage
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss
 from grimoire.data import tokenize_sft, tokenize_preference
 
 config = TrainingConfig(
@@ -77,6 +79,13 @@ ref_model.eval()
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
     loss_fn=DPOLoss(ref_model=ref_model, beta=0.1), train_dataset=pref_dataset,
+)
+trainer.train()
+
+# SimPO — reference-free, no NLL term, just margin-based preference
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=SimPOLoss(beta=2.0, gamma=0.5), train_dataset=pref_dataset,
 )
 trainer.train()
 ```
@@ -127,6 +136,15 @@ pi_ref     = reference model (frozen copy of initial weights)
 log(pi/pi_ref)(y) = avg_logp_pi(y|x) - avg_logp_ref(y|x)
 ```
 
+## SimPO Loss Formula
+
+```
+L_SimPO = -mean(log(sigmoid(beta * (avg_logp_chosen - avg_logp_rejected - gamma))))
+
+beta   = scaling factor (default 2.0, higher than DPO since no reference baseline)
+gamma  = target reward margin (default 0.5, enforces minimum gap between chosen/rejected)
+```
+
 ## Relationship to Merlina
 
 Grimoire is a standalone library that Merlina imports. Merlina handles:
@@ -137,7 +155,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO)
+- Loss computation (SFT, ORPO, DPO, SimPO)
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration

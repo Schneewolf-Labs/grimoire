@@ -1,4 +1,4 @@
-"""Tests for SFT, ORPO, and DPO loss functions."""
+"""Tests for SFT, ORPO, DPO, and SimPO loss functions."""
 
 import copy
 
@@ -8,6 +8,7 @@ import pytest
 from grimoire.losses.sft import SFTLoss
 from grimoire.losses.orpo import ORPOLoss, _pad_dim1
 from grimoire.losses.dpo import DPOLoss
+from grimoire.losses.simpo import SimPOLoss
 
 
 class SimpleModel(nn.Module):
@@ -329,3 +330,89 @@ class TestDPOLoss:
         loss, _ = loss_fn(model, batch, training=True)
         # -log(sigmoid(0)) = log(2) ≈ 0.6931
         assert abs(loss.item() - 0.6931) < 0.01
+
+
+class TestSimPOLoss:
+    def test_returns_scalar_loss_and_metrics(self):
+        model = SimpleModel()
+        loss_fn = SimPOLoss(beta=2.0, gamma=0.5)
+        loss_fn._pad_token_id = 0
+
+        batch = _make_preference_batch()
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert "chosen_rewards" in metrics
+        assert "rejected_rewards" in metrics
+        assert "reward_margin" in metrics
+        assert "reward_accuracy" in metrics
+        assert "logps_diff" in metrics
+
+    def test_eval_mode_uses_chosen_only(self):
+        model = SimpleModel()
+        loss_fn = SimPOLoss()
+
+        batch = _make_preference_batch()
+
+        loss, metrics = loss_fn(model, batch, training=False)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert metrics == {}
+
+    def test_beta_scales_loss(self):
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_low = SimPOLoss(beta=0.5, gamma=0.0)
+        loss_fn_low._pad_token_id = 0
+        loss_fn_high = SimPOLoss(beta=5.0, gamma=0.0)
+        loss_fn_high._pad_token_id = 0
+
+        loss_low, _ = loss_fn_low(model, batch, training=True)
+        loss_high, _ = loss_fn_high(model, batch, training=True)
+
+        # Higher beta amplifies the logp difference, changing the loss
+        assert loss_low.item() != loss_high.item()
+
+    def test_gamma_increases_loss(self):
+        """Higher gamma margin should increase loss when chosen-rejected gap is small."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_no_margin = SimPOLoss(beta=2.0, gamma=0.0)
+        loss_fn_no_margin._pad_token_id = 0
+        loss_fn_high_margin = SimPOLoss(beta=2.0, gamma=5.0)
+        loss_fn_high_margin._pad_token_id = 0
+
+        loss_no, _ = loss_fn_no_margin(model, batch, training=True)
+        loss_high, _ = loss_fn_high_margin(model, batch, training=True)
+
+        # Higher gamma subtracts more from the logp diff, making sigmoid input
+        # more negative, so loss increases
+        assert loss_high.item() > loss_no.item()
+
+    def test_handles_different_chosen_rejected_lengths(self):
+        model = SimpleModel()
+        loss_fn = SimPOLoss(beta=2.0, gamma=0.5)
+        loss_fn._pad_token_id = 0
+
+        batch = _make_preference_batch(chosen_len=6, rejected_len=10)
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_creates_correct_collator(self):
+        loss_fn = SimPOLoss()
+        from grimoire.data.preference import PreferenceCollator
+        collator = loss_fn.create_collator(pad_token_id=0)
+        assert isinstance(collator, PreferenceCollator)
+
+    def test_no_ref_model_needed(self):
+        """SimPO should work without any reference model."""
+        loss_fn = SimPOLoss()
+        assert not hasattr(loss_fn, "ref_model")
