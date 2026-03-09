@@ -25,10 +25,12 @@ grimoire/
 │   ├── sft.py         # SFT loss (NLL on target tokens)
 │   ├── orpo.py        # ORPO loss (SFT + odds ratio)
 │   ├── dpo.py         # DPO loss (reference model + preference)
-│   └── simpo.py       # SimPO loss (reference-free + reward margin)
+│   ├── simpo.py       # SimPO loss (reference-free + reward margin)
+│   └── kto.py         # KTO loss (unpaired binary feedback + reference model)
 └── data/
     ├── sft.py         # SFT collator + tokenization
-    └── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO)
+    ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO)
+    └── kto.py         # KTO collator + tokenization (unpaired feedback)
 ```
 
 ## Key Design Decisions
@@ -39,16 +41,17 @@ grimoire/
 - Multi-GPU, DeepSpeed, FSDP work out of the box via `accelerate config`
 - Gradient checkpointing with `use_reentrant=False` for DDP/FSDP compatibility
 - Single concatenated forward pass for ORPO/DPO/SimPO (chosen + rejected in one call)
-- Average log probabilities for ORPO/DPO/SimPO stability across varying response lengths
+- Average log probabilities for ORPO/DPO/SimPO/KTO stability across varying response lengths
 - DPO uses a frozen reference model passed to the loss function (caller manages lifecycle)
 - SimPO is reference-free like ORPO but uses only a margin-based preference loss (no NLL term)
+- KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 
 ## Usage
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss
-from grimoire.data import tokenize_sft, tokenize_preference
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss
+from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto
 
 config = TrainingConfig(
     output_dir="./output",
@@ -86,6 +89,16 @@ trainer.train()
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
     loss_fn=SimPOLoss(beta=2.0, gamma=0.5), train_dataset=pref_dataset,
+)
+trainer.train()
+
+# KTO — unpaired binary feedback, requires reference model
+import copy
+ref_model = copy.deepcopy(model)
+ref_model.eval()
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=KTOLoss(ref_model=ref_model, beta=0.1), train_dataset=kto_dataset,
 )
 trainer.train()
 ```
@@ -145,6 +158,22 @@ beta   = scaling factor (default 2.0, higher than DPO since no reference baselin
 gamma  = target reward margin (default 0.5, enforces minimum gap between chosen/rejected)
 ```
 
+## KTO Loss Formula
+
+```
+L_KTO = mean(desirable_losses) + mean(undesirable_losses)
+
+desirable_loss   = lambda_d * (1 - sigmoid(beta * (log_ratio - KL_ref)))
+undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
+
+log_ratio = avg_logp_policy(y|x) - avg_logp_ref(y|x)
+KL_ref    = clamp(mean(log_ratio), min=0)  (estimated from batch)
+
+beta      = scaling factor (default 0.1)
+lambda_d  = desirable weight (default 1.0)
+lambda_u  = undesirable weight (default 1.0, higher = loss aversion)
+```
+
 ## Relationship to Merlina
 
 Grimoire is a standalone library that Merlina imports. Merlina handles:
@@ -155,7 +184,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO)
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration
