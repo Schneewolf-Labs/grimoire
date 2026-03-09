@@ -114,9 +114,13 @@ trainer = GrimoireTrainer(
 )
 ```
 
-## Choosing a training method
+## Guides
 
-Not sure which loss to use? See the **[Training Methods Guide](docs/training-methods.md)** for a decision tree, quick reference table, and code examples for all 7 methods (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO).
+- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 7 methods
+- **[Loss Formulas](docs/loss-formulas.md)** — Side-by-side math for every loss function
+- **[Callbacks](docs/callbacks.md)** — Hooking into the training loop for logging, early stopping, and more
+- **[Multi-GPU, DeepSpeed, and FSDP](docs/deepspeed.md)** — Distributed training setup, example configs, and memory tips
+- **[Writing a Custom Loss](docs/custom-loss.md)** — How to add a new training method
 
 ## Multi-GPU
 
