@@ -114,6 +114,10 @@ trainer = GrimoireTrainer(
 )
 ```
 
+## Choosing a training method
+
+Not sure which loss to use? See the **[Training Methods Guide](docs/training-methods.md)** for a decision tree, quick reference table, and code examples for all 7 methods (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO).
+
 ## Multi-GPU
 
 No code changes. Configure with `accelerate` and launch:

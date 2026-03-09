@@ -35,55 +35,6 @@ grimoire/
     └── kto.py         # KTO collator + tokenization (unpaired feedback)
 ```
 
-## Choosing a Training Method
-
-### Start here: What data do you have?
-
-- **Prompt + completion examples** (no preference pairs) → **SFT**
-- **Thumbs-up / thumbs-down per response** (unpaired feedback) → **KTO**
-- **Chosen + rejected response pairs** → see preference methods below
-
-### Preference methods decision tree
-
-**Do you have enough GPU memory to hold two copies of the model?**
-
-- **No** (single model only) → pick a reference-free method:
-  - **ORPO** — Good default. Combines SFT + preference in one loss, so you can align from a base model in a single training run. Best when you also need the model to learn the task (not just preferences).
-  - **SimPO** — Use when the model already knows the task (e.g., after SFT) and you only want preference alignment. Simpler than ORPO (no SFT term), uses a reward margin to enforce a gap between chosen and rejected.
-  - **CPO** — Like ORPO but uses a contrastive preference term instead of odds ratio. Theoretically cleaner; try it if ORPO isn't converging well.
-
-- **Yes** (can load a frozen reference model) → pick a reference-based method:
-  - **DPO** — The standard. Well-studied, reliable. Start here if you can afford the memory.
-  - **IPO** — Use instead of DPO when your preference labels are noisy or crowd-sourced. Squared loss prevents overfitting to mislabeled pairs.
-
-### When to use KTO
-
-KTO is the only method that works with **unpaired** feedback — each example is independently labeled good or bad, with no need to pair chosen/rejected responses for the same prompt. Use it when:
-- You have binary feedback from users (likes/dislikes, accept/reject)
-- Collecting paired preferences is impractical
-- You want to weight desirable vs undesirable examples differently (loss aversion via `lambda_u`)
-
-KTO requires a frozen reference model (same memory cost as DPO/IPO).
-
-### Quick reference
-
-| Method | Data Format | Ref Model | Memory | Best For |
-|--------|-------------|-----------|--------|----------|
-| SFT | Completions | No | Low | Teaching a task from scratch |
-| ORPO | Paired | No | Low | SFT + alignment in one pass |
-| SimPO | Paired | No | Low | Alignment after SFT (margin-based) |
-| CPO | Paired | No | Low | Alignment after SFT (contrastive) |
-| DPO | Paired | Yes | High | Standard preference alignment |
-| IPO | Paired | Yes | High | Noisy preference data |
-| KTO | Unpaired | Yes | High | Binary feedback (no pairs) |
-
-### Typical training pipelines
-
-1. **Base model → instruction follower:** SFT
-2. **Base model → aligned in one step:** ORPO or CPO
-3. **SFT model → aligned:** DPO, SimPO, or IPO
-4. **SFT model → aligned from user feedback:** KTO
-
 ## Key Design Decisions
 
 - Uses `accelerate.Accelerator` directly for full control over the training loop
