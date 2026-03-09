@@ -4,7 +4,6 @@ import copy
 
 import torch
 import torch.nn as nn
-import pytest
 from grimoire.losses.sft import SFTLoss
 from grimoire.losses.orpo import ORPOLoss, _pad_dim1
 from grimoire.losses.dpo import DPOLoss

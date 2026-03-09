@@ -1,7 +1,7 @@
-from .sft import SFTLoss
-from .orpo import ORPOLoss
-from .dpo import DPOLoss
-from .simpo import SimPOLoss
-from .kto import KTOLoss
-from .cpo import CPOLoss
-from .ipo import IPOLoss
+from .sft import SFTLoss as SFTLoss
+from .orpo import ORPOLoss as ORPOLoss
+from .dpo import DPOLoss as DPOLoss
+from .simpo import SimPOLoss as SimPOLoss
+from .kto import KTOLoss as KTOLoss
+from .cpo import CPOLoss as CPOLoss
+from .ipo import IPOLoss as IPOLoss

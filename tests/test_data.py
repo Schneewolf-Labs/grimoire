@@ -1,6 +1,5 @@
 """Tests for data collators and tokenization utilities."""
 
-import torch
 import pytest
 from grimoire.data.sft import SFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference

@@ -265,7 +265,7 @@ class TestORPOTraining:
 
             assert len(losses) > 0
             # At minimum, loss should not be NaN
-            assert all(not torch.tensor(l).isnan() for l in losses), "NaN loss detected"
+            assert all(not torch.tensor(loss).isnan() for loss in losses), "NaN loss detected"
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
