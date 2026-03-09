@@ -3,3 +3,5 @@ from .orpo import ORPOLoss
 from .dpo import DPOLoss
 from .simpo import SimPOLoss
 from .kto import KTOLoss
+from .cpo import CPOLoss
+from .ipo import IPOLoss
