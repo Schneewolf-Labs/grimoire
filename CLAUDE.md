@@ -26,10 +26,12 @@ grimoire/
 │   ├── orpo.py        # ORPO loss (SFT + odds ratio)
 │   ├── dpo.py         # DPO loss (reference model + preference)
 │   ├── simpo.py       # SimPO loss (reference-free + reward margin)
-│   └── kto.py         # KTO loss (unpaired binary feedback + reference model)
+│   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
+│   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
+│   └── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
 └── data/
     ├── sft.py         # SFT collator + tokenization
-    ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO)
+    ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
     └── kto.py         # KTO collator + tokenization (unpaired feedback)
 ```
 
@@ -40,17 +42,19 @@ grimoire/
 - Loss functions own their data collators via `create_collator(pad_token_id)`
 - Multi-GPU, DeepSpeed, FSDP work out of the box via `accelerate config`
 - Gradient checkpointing with `use_reentrant=False` for DDP/FSDP compatibility
-- Single concatenated forward pass for ORPO/DPO/SimPO (chosen + rejected in one call)
-- Average log probabilities for ORPO/DPO/SimPO/KTO stability across varying response lengths
+- Single concatenated forward pass for ORPO/DPO/SimPO/CPO/IPO (chosen + rejected in one call)
+- Average log probabilities for ORPO/DPO/SimPO/KTO/CPO/IPO stability across varying response lengths
 - DPO uses a frozen reference model passed to the loss function (caller manages lifecycle)
 - SimPO is reference-free like ORPO but uses only a margin-based preference loss (no NLL term)
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
+- CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
+- IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
 
 ## Usage
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss
 from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto
 
 config = TrainingConfig(
@@ -99,6 +103,23 @@ ref_model.eval()
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
     loss_fn=KTOLoss(ref_model=ref_model, beta=0.1), train_dataset=kto_dataset,
+)
+trainer.train()
+
+# CPO — reference-free, SFT + contrastive preference
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=CPOLoss(beta=0.1), train_dataset=pref_dataset,
+)
+trainer.train()
+
+# IPO — like DPO but with squared loss (robust to noisy preferences)
+import copy
+ref_model = copy.deepcopy(model)
+ref_model.eval()
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=IPOLoss(ref_model=ref_model, beta=0.1), train_dataset=pref_dataset,
 )
 trainer.train()
 ```
@@ -174,6 +195,25 @@ lambda_d  = desirable weight (default 1.0)
 lambda_u  = undesirable weight (default 1.0, higher = loss aversion)
 ```
 
+## CPO Loss Formula
+
+```
+L_CPO = L_SFT(chosen) + beta * L_preference
+
+L_SFT        = CrossEntropy on chosen response tokens (prompt masked)
+L_preference = -mean(log(sigmoid(beta * (avg_logp_chosen - avg_logp_rejected))))
+```
+
+## IPO Loss Formula
+
+```
+L_IPO = mean((log(pi/pi_ref)(chosen) - log(pi/pi_ref)(rejected) - 1/(2*beta))^2)
+
+pi         = policy model (being trained)
+pi_ref     = reference model (frozen copy of initial weights)
+beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
+```
+
 ## Relationship to Merlina
 
 Grimoire is a standalone library that Merlina imports. Merlina handles:
@@ -184,7 +224,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO, KTO)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO)
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration
