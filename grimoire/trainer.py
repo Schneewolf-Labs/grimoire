@@ -277,12 +277,15 @@ class GrimoireTrainer:
         for batch in self.eval_dataloader:
             loss, metrics = self.loss_fn(self.model, batch, training=False)
 
-            # Gather loss across all processes
-            loss = self.accelerator.gather(loss).mean()
+            # Reduce loss across all processes (average, not gather+mean)
+            loss = self.accelerator.reduce(loss, reduction="mean")
             total_loss += loss.item()
 
+            # Reduce metrics across all processes
             for k, v in metrics.items():
-                total_metrics[k] = total_metrics.get(k, 0.0) + v
+                v_tensor = torch.tensor(v, device=self.accelerator.device)
+                v_reduced = self.accelerator.reduce(v_tensor, reduction="mean")
+                total_metrics[k] = total_metrics.get(k, 0.0) + v_reduced.item()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)

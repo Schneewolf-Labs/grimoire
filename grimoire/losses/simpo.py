@@ -103,4 +103,4 @@ class SimPOLoss:
         gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
         per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
 
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)

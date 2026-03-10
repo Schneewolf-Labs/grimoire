@@ -23,6 +23,8 @@ class KTOLoss:
     """
 
     def __init__(self, ref_model, beta=0.1, lambda_d=1.0, lambda_u=1.0, label_pad_token_id=-100):
+        if ref_model.training:
+            raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
         self.beta = beta
         self.lambda_d = lambda_d
@@ -76,6 +78,9 @@ class KTOLoss:
             loss = loss + undesirable_loss.mean()
             n_terms += 1
 
+        if n_terms > 1:
+            loss = loss / n_terms
+
         # Implicit rewards: beta * log(pi/pi_ref)
         rewards = self.beta * log_ratio.detach()
         desirable_rewards = rewards[desirable_mask] if desirable_mask.any() else torch.zeros(1, device=input_ids.device)
@@ -116,4 +121,4 @@ class KTOLoss:
             index=shift_labels.unsqueeze(2),
         ).squeeze(2)
 
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
