@@ -208,7 +208,7 @@ class GrimoireTrainer:
 
                     self.optimizer.step()
                     self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 # Only count actual optimization steps (after gradient accumulation)
                 if self.accelerator.sync_gradients:
