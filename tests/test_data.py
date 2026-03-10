@@ -4,6 +4,7 @@ import pytest
 from grimoire.data.sft import SFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
 from grimoire.data.kto import KTOCollator, tokenize_kto
+from grimoire.data.prompt import PromptCollator, tokenize_prompt
 
 
 class TestSFTCollator:
@@ -202,3 +203,82 @@ class TestTokenizeKTO:
 
         assert tokenize_kto(desirable, mock_tokenizer)["kto_label"] is True
         assert tokenize_kto(undesirable, mock_tokenizer)["kto_label"] is False
+
+
+class TestPromptCollator:
+    def test_left_pads_to_max_length(self):
+        collator = PromptCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
+            {"input_ids": [4, 5], "attention_mask": [1, 1]},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (2, 3)
+        assert batch["attention_mask"].shape == (2, 3)
+
+        # First sequence: no padding needed
+        assert batch["input_ids"][0].tolist() == [1, 2, 3]
+        assert batch["attention_mask"][0].tolist() == [1, 1, 1]
+
+        # Second sequence: left-padded
+        assert batch["input_ids"][1].tolist() == [0, 4, 5]
+        assert batch["attention_mask"][1].tolist() == [0, 1, 1]
+
+    def test_single_element_batch(self):
+        collator = PromptCollator(pad_token_id=0)
+        features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (1, 2)
+        assert batch["input_ids"][0].tolist() == [1, 2]
+
+    def test_equal_lengths_no_padding(self):
+        collator = PromptCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
+            {"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1]},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (2, 3)
+        assert (batch["attention_mask"] == 1).all()
+
+    def test_only_has_input_ids_and_attention_mask(self):
+        """Prompt collator should not produce labels."""
+        collator = PromptCollator(pad_token_id=0)
+        features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
+        batch = collator(features)
+
+        assert set(batch.keys()) == {"input_ids", "attention_mask"}
+
+
+class TestTokenizePrompt:
+    @pytest.fixture
+    def mock_tokenizer(self):
+        class MockTokenizer:
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return MockTokenizer()
+
+    def test_produces_correct_keys(self, mock_tokenizer):
+        example = {"prompt": "hello"}
+        result = tokenize_prompt(example, mock_tokenizer)
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert "labels" not in result  # prompts don't have labels
+
+    def test_tokenizes_prompt_field(self, mock_tokenizer):
+        example = {"prompt": "AB"}
+        result = tokenize_prompt(example, mock_tokenizer)
+
+        assert result["input_ids"] == [ord("A"), ord("B")]
+        assert result["attention_mask"] == [1, 1]
+
+    def test_custom_prompt_field(self, mock_tokenizer):
+        example = {"question": "XY"}
+        result = tokenize_prompt(example, mock_tokenizer, prompt_field="question")
+
+        assert result["input_ids"] == [ord("X"), ord("Y")]

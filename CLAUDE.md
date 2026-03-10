@@ -28,11 +28,14 @@ grimoire/
 │   ├── simpo.py       # SimPO loss (reference-free + reward margin)
 │   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
 │   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
-│   └── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
+│   ├── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
+│   ├── grpo.py        # GRPO loss (group-relative advantages + online generation)
+│   └── ppo.py         # PPO loss (value baseline + clipped surrogate + online generation)
 └── data/
     ├── sft.py         # SFT collator + tokenization
     ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
-    └── kto.py         # KTO collator + tokenization (unpaired feedback)
+    ├── kto.py         # KTO collator + tokenization (unpaired feedback)
+    └── prompt.py      # Prompt-only collator + tokenization (PPO/GRPO)
 ```
 
 ## Key Design Decisions
@@ -49,13 +52,18 @@ grimoire/
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
+- GRPO generates multiple completions per prompt, uses group-relative advantages (no value network), KL penalty against reference model
+- PPO generates completions, uses a learned value head for advantage estimation, clipped surrogate objective + KL penalty
+- PPO/GRPO are online RL methods: they generate completions during training and require a reward function
+- PPO attaches a value head to the model in __init__ — create PPOLoss BEFORE GrimoireTrainer so parameters are in the optimizer
+- Prompt-only data uses left-padding for generation compatibility
 
 ## Usage
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss
-from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss, PPOLoss
+from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_prompt
 
 config = TrainingConfig(
     output_dir="./output",
@@ -120,6 +128,36 @@ ref_model.eval()
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
     loss_fn=IPOLoss(ref_model=ref_model, beta=0.1), train_dataset=pref_dataset,
+)
+trainer.train()
+
+# GRPO — online RL with group-relative advantages, no value network
+import copy
+ref_model = copy.deepcopy(model)
+ref_model.eval()
+def reward_fn(prompts, completions):
+    return [score(p, c) for p, c in zip(prompts, completions)]
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=GRPOLoss(
+        ref_model=ref_model, reward_fn=reward_fn, tokenizer=tokenizer,
+        num_generations=4, beta=0.04,
+    ),
+    train_dataset=prompt_dataset,
+)
+trainer.train()
+
+# PPO — online RL with value baseline (create loss BEFORE trainer)
+import copy
+ref_model = copy.deepcopy(model)
+ref_model.eval()
+loss_fn = PPOLoss(
+    model=model, ref_model=ref_model, reward_fn=reward_fn,
+    tokenizer=tokenizer, beta=0.1, clip_eps=0.2, vf_coef=0.1,
+)
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=loss_fn, train_dataset=prompt_dataset,
 )
 trainer.train()
 ```
@@ -214,6 +252,39 @@ pi_ref     = reference model (frozen copy of initial weights)
 beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
 ```
 
+## GRPO Loss Formula
+
+```
+L_GRPO = -mean(A_i * avg_logp_policy(o_i)) + beta * KL(policy || ref)
+
+For each prompt x, sample G completions {o_1, ..., o_G}:
+  r_i     = reward_fn(x, o_i)
+  A_i     = (r_i - mean(r)) / (std(r) + eps)   (group-relative advantage)
+  KL      = mean(avg_logp_policy - avg_logp_ref)
+
+beta              = KL penalty coefficient (default 0.04)
+num_generations   = G, completions per prompt (default 4)
+```
+
+## PPO Loss Formula
+
+```
+L_PPO = policy_loss + vf_coef * value_loss - entropy_coef * entropy
+
+policy_loss = -mean(min(ratio * A, clip(ratio, 1-eps, 1+eps) * A))
+value_loss  = MSE(V(s), R_penalized)
+entropy     = mean per-token entropy bonus
+
+ratio         = exp(new_logp - old_logp)
+A             = R_penalized - V(s)          (advantage = reward - value baseline)
+R_penalized   = reward - beta * KL          (KL-penalized reward)
+
+beta          = KL penalty coefficient (default 0.1)
+clip_eps      = clipping epsilon (default 0.2)
+vf_coef       = value loss weight (default 0.1)
+entropy_coef  = entropy bonus weight (default 0.01)
+```
+
 ## Relationship to Merlina
 
 Grimoire is a standalone library that Merlina imports. Merlina handles:
@@ -224,7 +295,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, PPO)
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration

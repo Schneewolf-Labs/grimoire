@@ -5,3 +5,5 @@ from .simpo import SimPOLoss as SimPOLoss
 from .kto import KTOLoss as KTOLoss
 from .cpo import CPOLoss as CPOLoss
 from .ipo import IPOLoss as IPOLoss
+from .grpo import GRPOLoss as GRPOLoss
+from .ppo import PPOLoss as PPOLoss

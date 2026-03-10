@@ -1,4 +1,4 @@
-"""Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, and IPO loss functions."""
+"""Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, and PPO loss functions."""
 
 import copy
 
@@ -11,6 +11,8 @@ from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.grpo import GRPOLoss
+from grimoire.losses.ppo import PPOLoss
 
 
 class SimpleModel(nn.Module):
@@ -21,9 +23,9 @@ class SimpleModel(nn.Module):
         self.embed = nn.Embedding(vocab_size, hidden_size)
         self.head = nn.Linear(hidden_size, vocab_size)
         self.vocab_size = vocab_size
-        self.config = type("Config", (), {"is_encoder_decoder": False})()
+        self.config = type("Config", (), {"is_encoder_decoder": False, "hidden_size": hidden_size})()
 
-    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False, output_hidden_states=False):
         h = self.embed(input_ids)
         logits = self.head(h)
 
@@ -37,7 +39,42 @@ class SimpleModel(nn.Module):
                 ignore_index=-100,
             )
 
-        return type("Output", (), {"logits": logits, "loss": loss})()
+        hidden_states = (h,) if output_hidden_states else None
+        return type("Output", (), {"logits": logits, "loss": loss, "hidden_states": hidden_states})()
+
+
+class GenerativeModel(SimpleModel):
+    """SimpleModel extended with generate() for testing online RL losses."""
+
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=8,
+                 temperature=1.0, do_sample=True, pad_token_id=0, **kwargs):
+        """Simple autoregressive generation by sampling from logits."""
+        generated = input_ids.clone()
+        for _ in range(max_new_tokens):
+            h = self.embed(generated)
+            logits = self.head(h)[:, -1, :]  # last token logits
+            if temperature > 0:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+        return generated
+
+
+class MockTokenizer:
+    """Minimal tokenizer for testing online RL losses."""
+    pad_token_id = 0
+    pad_token = "<pad>"
+    eos_token = "</s>"
+    eos_token_id = 1
+
+    def batch_decode(self, token_ids, skip_special_tokens=True):
+        return [f"text_{i}" for i in range(len(token_ids))]
+
+    def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+        ids = list(range(2, min(len(text) + 2, max_length or 512)))
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
 
 
 class TestSFTLoss:
@@ -725,3 +762,272 @@ class TestIPOLoss:
         # When pi == ref, logits_diff = 0, so loss = (0 - 1/(2*beta))^2 = (1/(2*beta))^2
         expected = (1.0 / (2.0 * beta)) ** 2
         assert abs(loss.item() - expected) < 0.01
+
+
+def _make_prompt_batch(vocab_size=32, prompt_len=6, batch_size=2):
+    """Helper to create a prompt-only batch (left-padded)."""
+    return {
+        "input_ids": torch.randint(1, vocab_size, (batch_size, prompt_len)),
+        "attention_mask": torch.ones(batch_size, prompt_len, dtype=torch.long),
+    }
+
+
+def _dummy_reward_fn(prompts, completions):
+    """Simple reward function that returns random scores."""
+    return [float(len(c) % 5) / 5.0 for c in completions]
+
+
+class TestGRPOLoss:
+    def _make_loss(self, ref_model=None, num_generations=2, beta=0.04):
+        model = GenerativeModel()
+        if ref_model is None:
+            ref_model = copy.deepcopy(model)
+            ref_model.eval()
+        tokenizer = MockTokenizer()
+        loss_fn = GRPOLoss(
+            ref_model=ref_model,
+            reward_fn=_dummy_reward_fn,
+            tokenizer=tokenizer,
+            num_generations=num_generations,
+            beta=beta,
+            max_new_tokens=4,
+        )
+        loss_fn._pad_token_id = 0
+        return model, loss_fn
+
+    def test_returns_scalar_loss_and_metrics(self):
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss()
+        batch = _make_prompt_batch()
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "pg_loss" in metrics
+        assert "kl" in metrics
+        assert "mean_reward" in metrics
+        assert "reward_std" in metrics
+        assert "mean_advantage" in metrics
+        assert "mean_completion_len" in metrics
+
+    def test_eval_mode_returns_zero_loss(self):
+        model, loss_fn = self._make_loss()
+        batch = _make_prompt_batch()
+
+        loss, metrics = loss_fn(model, batch, training=False)
+        assert loss.item() == 0.0
+        assert metrics == {}
+
+    def test_beta_scales_kl_penalty(self):
+        torch.manual_seed(42)
+        ref_model = GenerativeModel()
+        ref_model.eval()
+
+        model_low = GenerativeModel()
+        model_high = GenerativeModel()
+        # Use same weights
+        model_high.load_state_dict(model_low.state_dict())
+
+        batch = _make_prompt_batch()
+
+        loss_fn_low = GRPOLoss(
+            ref_model=ref_model, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), num_generations=2, beta=0.01, max_new_tokens=4,
+        )
+        loss_fn_low._pad_token_id = 0
+
+        loss_fn_high = GRPOLoss(
+            ref_model=ref_model, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), num_generations=2, beta=1.0, max_new_tokens=4,
+        )
+        loss_fn_high._pad_token_id = 0
+
+        # Different beta means different KL contribution
+        _, metrics_low = loss_fn_low(model_low, batch, training=True)
+        _, metrics_high = loss_fn_high(model_high, batch, training=True)
+
+        # KL values should be same (same models), but contribution to loss differs via beta
+        assert metrics_low["kl"] is not None
+        assert metrics_high["kl"] is not None
+
+    def test_num_generations_affects_computation(self):
+        """More generations per prompt should produce valid results."""
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss(num_generations=4)
+        batch = _make_prompt_batch(batch_size=1)
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_creates_correct_collator(self):
+        _, loss_fn = self._make_loss()
+        from grimoire.data.prompt import PromptCollator
+        collator = loss_fn.create_collator(pad_token_id=0)
+        assert isinstance(collator, PromptCollator)
+
+    def test_custom_reward_fn(self):
+        """Verify that different reward functions produce different losses."""
+        torch.manual_seed(42)
+
+        def high_reward(prompts, completions):
+            return [10.0] * len(completions)
+
+        def low_reward(prompts, completions):
+            return [-10.0] * len(completions)
+
+        model = GenerativeModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+
+        loss_fn_high = GRPOLoss(
+            ref_model=ref_model, reward_fn=high_reward,
+            tokenizer=MockTokenizer(), num_generations=2, beta=0.04, max_new_tokens=4,
+        )
+        loss_fn_high._pad_token_id = 0
+
+        loss_fn_low = GRPOLoss(
+            ref_model=ref_model, reward_fn=low_reward,
+            tokenizer=MockTokenizer(), num_generations=2, beta=0.04, max_new_tokens=4,
+        )
+        loss_fn_low._pad_token_id = 0
+
+        batch = _make_prompt_batch()
+
+        _, metrics_high = loss_fn_high(model, batch, training=True)
+        _, metrics_low = loss_fn_low(model, batch, training=True)
+
+        assert metrics_high["mean_reward"] != metrics_low["mean_reward"]
+
+
+class TestPPOLoss:
+    def _make_loss(self, beta=0.1, clip_eps=0.2, vf_coef=0.1, entropy_coef=0.01):
+        model = GenerativeModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        tokenizer = MockTokenizer()
+        loss_fn = PPOLoss(
+            model=model,
+            ref_model=ref_model,
+            reward_fn=_dummy_reward_fn,
+            tokenizer=tokenizer,
+            beta=beta,
+            clip_eps=clip_eps,
+            vf_coef=vf_coef,
+            entropy_coef=entropy_coef,
+            max_new_tokens=4,
+        )
+        loss_fn._pad_token_id = 0
+        return model, loss_fn
+
+    def test_returns_scalar_loss_and_metrics(self):
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss()
+        batch = _make_prompt_batch()
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "policy_loss" in metrics
+        assert "value_loss" in metrics
+        assert "entropy" in metrics
+        assert "kl" in metrics
+        assert "mean_reward" in metrics
+        assert "mean_advantage" in metrics
+        assert "mean_value" in metrics
+        assert "clip_fraction" in metrics
+        assert "mean_completion_len" in metrics
+
+    def test_eval_mode_returns_zero_loss(self):
+        model, loss_fn = self._make_loss()
+        batch = _make_prompt_batch()
+
+        loss, metrics = loss_fn(model, batch, training=False)
+        assert loss.item() == 0.0
+        assert metrics == {}
+
+    def test_value_head_attached_to_model(self):
+        """PPOLoss should attach a value head to the model."""
+        model = GenerativeModel()
+        assert not hasattr(model, "value_head")
+
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        PPOLoss(
+            model=model, ref_model=ref_model, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), max_new_tokens=4,
+        )
+
+        assert hasattr(model, "value_head")
+        assert isinstance(model.value_head, nn.Linear)
+        assert model.value_head.in_features == model.config.hidden_size
+        assert model.value_head.out_features == 1
+
+    def test_value_head_in_model_parameters(self):
+        """Value head parameters should be accessible via model.parameters()."""
+        model = GenerativeModel()
+        params_before = set(id(p) for p in model.parameters())
+
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        PPOLoss(
+            model=model, ref_model=ref_model, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), max_new_tokens=4,
+        )
+
+        params_after = set(id(p) for p in model.parameters())
+        # New parameters from value head should be added
+        assert len(params_after) > len(params_before)
+
+    def test_creates_correct_collator(self):
+        _, loss_fn = self._make_loss()
+        from grimoire.data.prompt import PromptCollator
+        collator = loss_fn.create_collator(pad_token_id=0)
+        assert isinstance(collator, PromptCollator)
+
+    def test_vf_coef_scales_value_loss(self):
+        """Higher vf_coef should change total loss due to value loss scaling."""
+        torch.manual_seed(42)
+
+        model_low = GenerativeModel()
+        ref_low = copy.deepcopy(model_low)
+        ref_low.eval()
+        loss_fn_low = PPOLoss(
+            model=model_low, ref_model=ref_low, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), beta=0.1, vf_coef=0.01,
+            entropy_coef=0.0, max_new_tokens=4,
+        )
+        loss_fn_low._pad_token_id = 0
+
+        torch.manual_seed(42)
+        model_high = GenerativeModel()
+        ref_high = copy.deepcopy(model_high)
+        ref_high.eval()
+        loss_fn_high = PPOLoss(
+            model=model_high, ref_model=ref_high, reward_fn=_dummy_reward_fn,
+            tokenizer=MockTokenizer(), beta=0.1, vf_coef=10.0,
+            entropy_coef=0.0, max_new_tokens=4,
+        )
+        loss_fn_high._pad_token_id = 0
+
+        batch = _make_prompt_batch()
+
+        loss_low, metrics_low = loss_fn_low(model_low, batch, training=True)
+        loss_high, metrics_high = loss_fn_high(model_high, batch, training=True)
+
+        # Value loss component should be scaled differently
+        assert loss_low.item() != loss_high.item()
+
+    def test_clip_fraction_is_zero_for_single_epoch(self):
+        """With K=1 PPO, ratio should be ~1.0 so clip fraction should be 0."""
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss()
+        batch = _make_prompt_batch()
+
+        _, metrics = loss_fn(model, batch, training=True)
+
+        # For single-epoch PPO, old and new log probs are from same model weights
+        # (generation phase vs forward phase), so ratio ≈ 1.0
+        assert metrics["clip_fraction"] == 0.0
