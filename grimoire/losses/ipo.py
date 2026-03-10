@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
 from .orpo import _pad_dim1

@@ -229,6 +229,14 @@ Grimoire handles:
 - Checkpointing and logging
 - Multi-GPU orchestration
 
+## CI Requirements
+
+Before considering any work done, you MUST ensure:
+1. `ruff check .` passes with no errors
+2. `pytest` passes with no failures
+
+These match the GitHub Actions workflow in `.github/workflows/tests.yml`.
+
 ## Testing
 
 ```bash
