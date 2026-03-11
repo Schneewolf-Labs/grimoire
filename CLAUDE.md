@@ -163,8 +163,10 @@ log_odds_ratio = log(P_c/(1-P_c)) - log(P_r/(1-P_r))
 ## DPO Loss Formula
 
 ```
-L_DPO = -mean(log(sigmoid(beta * (log(pi/pi_ref)(chosen) - log(pi/pi_ref)(rejected)))))
+L_DPO = -mean((1-eps)*log(sigmoid(x)) + eps*log(sigmoid(-x)))
 
+x          = beta * (log(pi/pi_ref)(chosen) - log(pi/pi_ref)(rejected))
+eps        = label_smoothing (default 0.0, set >0 for conservative regularization)
 pi         = policy model (being trained)
 pi_ref     = reference model (frozen copy of initial weights)
 log(pi/pi_ref)(y) = avg_logp_pi(y|x) - avg_logp_ref(y|x)
@@ -201,7 +203,9 @@ lambda_u  = undesirable weight (default 1.0, higher = loss aversion)
 L_CPO = L_SFT(chosen) + beta * L_preference
 
 L_SFT        = CrossEntropy on chosen response tokens (prompt masked)
-L_preference = -mean(log(sigmoid(beta * (avg_logp_chosen - avg_logp_rejected))))
+L_preference = -mean((1-eps)*log(sigmoid(x)) + eps*log(sigmoid(-x)))
+x             = beta * (avg_logp_chosen - avg_logp_rejected)
+eps           = label_smoothing (default 0.0, set >0 for conservative regularization)
 ```
 
 ## IPO Loss Formula
