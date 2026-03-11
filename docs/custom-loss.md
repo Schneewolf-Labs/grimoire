@@ -121,6 +121,17 @@ def create_collator(self, pad_token_id):
     return KTOCollator(pad_token_id=pad_token_id)
 ```
 
+### GRPOCollator
+
+For prompt-only data. Produces `input_ids` and `attention_mask` with no labels — completions are generated during training.
+
+```python
+from grimoire.data.grpo import GRPOCollator
+
+def create_collator(self, pad_token_id):
+    return GRPOCollator(pad_token_id=pad_token_id)
+```
+
 ### Writing a Custom Collator
 
 If your data format doesn't fit any built-in collator, write your own. A collator is just a callable that takes a list of dicts and returns a batched dict of tensors:

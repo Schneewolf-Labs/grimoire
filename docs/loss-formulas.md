@@ -115,6 +115,30 @@ log_ratio(y) = avg_logp_pi(y|x) - avg_logp_ref(y|x)
 
 **DPO vs IPO:** DPO's log-sigmoid can saturate, causing the model to overfit to mislabeled preferences. IPO's squared loss keeps pushing toward the target margin without saturating.
 
+## GRPO
+
+[arXiv:2402.03300](https://arxiv.org/abs/2402.03300)
+
+Group Relative Policy Optimization. Generates G completions per prompt, scores them with a reward function, normalizes rewards within each group, and optimizes with a clipped REINFORCE objective. No pre-labeled data or reference model needed.
+
+```
+L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
+
+ratio         = pi(y|x) / pi_old(y|x)
+clipped_ratio = clamp(ratio, 1 - epsilon, 1 + epsilon)
+advantages    = (r - mean(r_group)) / std(r_group)
+KL            = mean(log_pi_old(y|x) - log_pi(y|x))
+```
+
+- `pi` = policy model (being trained)
+- `pi_old` = generation policy (same model, frozen snapshot from this step's generation)
+- `r` = reward scores from `reward_fn`
+- `G` = `num_generations` — completions sampled per prompt
+- `beta` = KL penalty weight (default 0.04)
+- `epsilon` = clip ratio (default 0.2)
+
+**How it works:** For each prompt, `G` completions are sampled, scored by `reward_fn`, and normalized relative to the group mean and std. The clipped ratio prevents large policy updates (same mechanism as PPO), while the KL term keeps the policy from drifting too far from the generation distribution.
+
 ## Comparison
 
 | Method | Loss Type | Reference Model | Key Innovation |
@@ -126,6 +150,7 @@ log_ratio(y) = avg_logp_pi(y|x) - avg_logp_ref(y|x)
 | KTO | Sigmoid | Yes | Unpaired binary feedback |
 | CPO | Cross-entropy + log-sigmoid | No | Contrastive (simpler than odds ratio) |
 | IPO | Squared | Yes | Robust to noisy labels |
+| GRPO | Clipped REINFORCE | No | Group-relative reward normalization |
 
 ## Implementation Details
 

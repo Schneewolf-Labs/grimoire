@@ -116,7 +116,7 @@ trainer = GrimoireTrainer(
 
 ## Guides
 
-- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 7 methods
+- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 8 methods
 - **[Loss Formulas](docs/loss-formulas.md)** — Side-by-side math for every loss function
 - **[Callbacks](docs/callbacks.md)** — Hooking into the training loop for logging, early stopping, and more
 - **[Multi-GPU, DeepSpeed, and FSDP](docs/deepspeed.md)** — Distributed training setup, example configs, and memory tips
@@ -204,11 +204,20 @@ grimoire/
 ├── config.py          # TrainingConfig dataclass
 ├── callbacks.py       # TrainerCallback base class
 ├── losses/
-│   ├── sft.py         # SFT loss — model(input_ids, labels=labels).loss
-│   └── orpo.py        # ORPO loss — NLL + odds ratio
+│   ├── sft.py         # SFT loss — NLL on target tokens
+│   ├── orpo.py        # ORPO loss — SFT + odds ratio
+│   ├── dpo.py         # DPO loss — reference model + preference
+│   ├── simpo.py       # SimPO loss — reference-free + reward margin
+│   ├── kto.py         # KTO loss — unpaired binary feedback
+│   ├── cpo.py         # CPO loss — reference-free + contrastive preference
+│   ├── ipo.py         # IPO loss — squared loss variant of DPO
+│   └── grpo.py        # GRPO loss — group relative policy optimization
 └── data/
     ├── sft.py         # SFTCollator + tokenize_sft()
-    └── preference.py  # PreferenceCollator + tokenize_preference()
+    ├── preference.py  # PreferenceCollator + tokenize_preference()
+    ├── kto.py         # KTOCollator + tokenize_kto()
+    ├── grpo.py        # GRPOCollator + tokenize_grpo()
+    └── cache.py       # cache_reference_log_probs() — precompute ref logps
 ```
 
 ### Loss function interface
