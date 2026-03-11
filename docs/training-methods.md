@@ -1,12 +1,13 @@
 # Choosing a Training Method
 
-Grimoire supports 7 training methods. This guide helps you pick the right one.
+Grimoire supports 8 training methods. This guide helps you pick the right one.
 
 ## Start here: What data do you have?
 
 - **Prompt + completion examples** (no preference pairs) → [**SFT**](#sft)
 - **Thumbs-up / thumbs-down per response** (unpaired feedback) → [**KTO**](#kto)
 - **Chosen + rejected response pairs** → see [preference methods](#preference-methods) below
+- **Prompts + a reward function** (generate and score on-the-fly) → [**GRPO**](#grpo)
 
 ## SFT
 
@@ -107,6 +108,27 @@ trainer = GrimoireTrainer(
 ```
 L_DPO = -mean(log(sigmoid(beta * (log(pi/pi_ref)(chosen) - log(pi/pi_ref)(rejected)))))
 ```
+
+**Memory tip — caching reference log probs:** Since the reference model is frozen, its log probs never change. You can precompute them once, store them in the dataset, and delete the reference model before training. This halves memory during training:
+
+```python
+from grimoire.data import cache_reference_log_probs
+
+loss_fn = DPOLoss(ref_model=ref_model, beta=0.1)
+collator = loss_fn.create_collator(tokenizer.pad_token_id)
+dataset = cache_reference_log_probs(ref_model, dataset, collator)
+
+del ref_model
+import torch; torch.cuda.empty_cache()
+
+# DPOLoss will use the cached values automatically — no ref_model needed
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=DPOLoss(beta=0.1), train_dataset=dataset,
+)
+```
+
+This also works with `IPOLoss` and `KTOLoss`.
 
 ### SimPO
 
@@ -213,6 +235,55 @@ desirable_loss   = lambda_d * (1 - sigmoid(beta * (log_ratio - KL_ref)))
 undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 ```
 
+## GRPO
+
+Group Relative Policy Optimization. Generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
+
+- **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
+- **Memory:** Very high (generation + two forward passes per batch)
+- **Key params:** `reward_fn` — callable `(prompts, completions) → list[float]`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
+- **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access
+
+```python
+import copy
+from grimoire.losses import GRPOLoss
+from grimoire.data import tokenize_grpo
+
+# Dataset needs only prompts — no responses required
+dataset = dataset.map(
+    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
+    remove_columns=dataset.column_names,
+)
+
+def reward_fn(prompts, completions):
+    # Return a score for each (prompt, completion) pair
+    return [score_completion(p, c) for p, c in zip(prompts, completions)]
+
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=GRPOLoss(
+        reward_fn=reward_fn,
+        tokenizer=tokenizer,
+        num_generations=4,
+        beta=0.04,
+        epsilon=0.2,
+        max_new_tokens=512,
+    ),
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+**Loss formula:**
+```
+L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
+
+ratio         = pi(y|x) / pi_old(y|x)
+clipped_ratio = clamp(ratio, 1-epsilon, 1+epsilon)
+advantages    = (r - mean(r_group)) / std(r_group)   # normalized within group of G
+KL            = mean(log_pi_old(y|x) - log_pi(y|x))
+```
+
 ## Quick Reference
 
 | Method | Data Format | Ref Model | Memory | Best For |
@@ -224,6 +295,7 @@ undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 | DPO | Paired | Yes | High | Standard preference alignment |
 | IPO | Paired | Yes | High | Noisy preference data |
 | KTO | Unpaired | Yes | High | Binary feedback (no pairs) |
+| GRPO | Prompts only | No | Very high | Verifiable reward signal (math, code) |
 
 ## Typical Training Pipelines
 
@@ -231,3 +303,4 @@ undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 2. **Base model → aligned in one step:** ORPO or CPO
 3. **SFT model → aligned:** DPO, SimPO, or IPO
 4. **SFT model → aligned from user feedback:** KTO
+5. **SFT model → aligned with a reward function:** GRPO
