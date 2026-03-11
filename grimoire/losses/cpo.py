@@ -42,20 +42,23 @@ class CPOLoss:
         input_ids, attention_mask, labels = self._concatenate(batch)
 
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        all_logps = self._get_batch_logps(logits, labels)
-        chosen_logps = all_logps[:len_chosen]
-        rejected_logps = all_logps[len_chosen:]
 
-        # SFT loss on chosen (using model's cross-entropy)
+        # SFT loss on chosen (using model's cross-entropy) — compute before freeing logits
         chosen_logits = logits[:len_chosen]
         chosen_labels = labels[:len_chosen]
-        shift_logits = chosen_logits[..., :-1, :].contiguous()
-        shift_labels = chosen_labels[..., 1:].contiguous()
+        shift_logits_nll = chosen_logits[..., :-1, :].contiguous()
+        shift_labels_nll = chosen_labels[..., 1:].contiguous()
         nll_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+            shift_logits_nll.view(-1, shift_logits_nll.size(-1)),
+            shift_labels_nll.view(-1),
             ignore_index=self.label_pad_token_id,
         )
+        del shift_logits_nll, shift_labels_nll
+
+        all_logps = self._get_batch_logps(logits, labels)
+        del logits
+        chosen_logps = all_logps[:len_chosen]
+        rejected_logps = all_logps[len_chosen:]
 
         # Preference loss: -log sigmoid(beta * (avg_logp_chosen - avg_logp_rejected))
         logits_diff = chosen_logps - rejected_logps

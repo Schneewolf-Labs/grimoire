@@ -43,6 +43,7 @@ class DPOLoss:
         # Policy log-probs
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         all_logps = self._get_batch_logps(logits, labels)
+        del logits
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
@@ -50,6 +51,7 @@ class DPOLoss:
         with torch.no_grad():
             ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
             ref_logps = self._get_batch_logps(ref_logits, labels)
+            del ref_logits
             ref_chosen_logps = ref_logps[:len_chosen]
             ref_rejected_logps = ref_logps[len_chosen:]
 

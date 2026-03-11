@@ -40,6 +40,7 @@ class SimPOLoss:
 
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         all_logps = self._get_batch_logps(logits, labels)
+        del logits
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 

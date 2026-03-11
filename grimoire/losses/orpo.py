@@ -44,6 +44,7 @@ class ORPOLoss:
 
         # Log probabilities (average per sequence for length-invariance)
         all_logps = self._get_batch_logps(logits, labels)
+        del logits
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
