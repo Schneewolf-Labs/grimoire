@@ -1,6 +1,7 @@
 """Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, and IPO loss functions."""
 
 import copy
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -40,6 +41,42 @@ class SimpleModel(nn.Module):
             )
 
         return type("Output", (), {"logits": logits, "loss": loss})()
+
+
+class PeftSimpleModel(SimpleModel):
+    """SimpleModel with PEFT-like adapter support for testing ref_model=None."""
+
+    def __init__(self, vocab_size=32, hidden_size=16):
+        super().__init__(vocab_size, hidden_size)
+        # Adapter: an extra linear layer added on top (simulates LoRA)
+        self.adapter = nn.Linear(hidden_size, hidden_size)
+        self._adapter_enabled = True
+
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
+        h = self.embed(input_ids)
+        if self._adapter_enabled:
+            h = h + self.adapter(h)
+        logits = self.head(h)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return type("Output", (), {"logits": logits, "loss": loss})()
+
+    @contextmanager
+    def disable_adapter(self):
+        self._adapter_enabled = False
+        try:
+            yield
+        finally:
+            self._adapter_enabled = True
 
 
 class TestSFTLoss:
@@ -336,6 +373,43 @@ class TestDPOLoss:
         # -log(sigmoid(0)) = log(2) ≈ 0.6931
         assert abs(loss.item() - 0.6931) < 0.01
 
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn = DPOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+
+    def test_peft_ref_differs_from_adapter_output(self):
+        """PEFT ref (adapter disabled) should produce different loss than identical ref."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        # With ref_model=None, reference = base model (adapter disabled)
+        loss_fn_peft = DPOLoss(ref_model=None, beta=0.1)
+        loss_fn_peft._pad_token_id = 0
+        loss_peft, _ = loss_fn_peft(model, batch, training=True)
+
+        # With ref_model = deepcopy (includes adapter), reference = full model
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        loss_fn_copy = DPOLoss(ref_model=ref_model, beta=0.1)
+        loss_fn_copy._pad_token_id = 0
+        loss_copy, _ = loss_fn_copy(model, batch, training=True)
+
+        # deepcopy ref includes the adapter, so pi == ref -> loss = log(2)
+        # PEFT ref disables adapter, so pi != ref -> loss != log(2)
+        assert abs(loss_copy.item() - 0.6931) < 0.01
+        assert loss_peft.item() != loss_copy.item()
+
     def test_label_smoothing_changes_loss(self):
         """Label smoothing should change loss when policy differs from ref."""
         torch.manual_seed(42)
@@ -592,6 +666,21 @@ class TestKTOLoss:
         collator = loss_fn.create_collator(pad_token_id=0)
         assert isinstance(collator, KTOCollator)
 
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_kto_batch()
+
+        loss_fn = KTOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+        assert "kl_ref" in metrics
+
 
 class TestCPOLoss:
     def test_returns_scalar_loss_and_metrics(self):
@@ -802,6 +891,20 @@ class TestIPOLoss:
         # When pi == ref, logits_diff = 0, so loss = (0 - 1/(2*beta))^2 = (1/(2*beta))^2
         expected = (1.0 / (2.0 * beta)) ** 2
         assert abs(loss.item() - expected) < 0.01
+
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn = IPOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
 
 
 def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):

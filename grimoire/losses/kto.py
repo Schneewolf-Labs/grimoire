@@ -55,13 +55,17 @@ class KTOLoss:
         # Reference log-probs: use cached values if available, else compute
         if "ref_logps" in batch:
             ref_logps = batch["ref_logps"].to(policy_logps.device)
-        elif self.ref_model is not None:
+        else:
             with torch.no_grad():
-                ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                if self.ref_model is not None:
+                    ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                elif hasattr(model, "disable_adapter"):
+                    with model.disable_adapter():
+                        ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                else:
+                    raise ValueError("KTOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
                 ref_logps = self._get_batch_logps(ref_logits, labels)
                 del ref_logits
-        else:
-            raise ValueError("KTOLoss requires either a ref_model or cached ref log probs in the batch")
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps
