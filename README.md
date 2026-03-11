@@ -1,4 +1,4 @@
-# Grimoire
+# 📖 Grimoire ✨
 
 A simple, multi-GPU LLM fine-tuning library. One training loop, pluggable loss functions.
 
