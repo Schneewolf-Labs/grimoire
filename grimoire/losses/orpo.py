@@ -50,8 +50,11 @@ class ORPOLoss:
         # Odds ratio: log(odds_chosen / odds_rejected)
         # where odds(x) = P(x) / (1 - P(x))
         # In log space: log_odds = log_p - log(1-p) = log_p - log1p(-exp(log_p))
-        log_odds = (chosen_logps - rejected_logps) - (
-            torch.log1p(-torch.exp(chosen_logps)) - torch.log1p(-torch.exp(rejected_logps))
+        # Clamp logps to avoid log1p(-1) = -inf when exp(logp) -> 1
+        clamped_chosen = chosen_logps.clamp(max=-1e-4)
+        clamped_rejected = rejected_logps.clamp(max=-1e-4)
+        log_odds = (clamped_chosen - clamped_rejected) - (
+            torch.log1p(-torch.exp(clamped_chosen)) - torch.log1p(-torch.exp(clamped_rejected))
         )
         ratio = F.logsigmoid(log_odds)
         or_loss = -self.beta * ratio.mean()
@@ -122,7 +125,7 @@ class ORPOLoss:
         gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
         per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
 
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
 
 
 def _pad_dim1(tensor, length, value):

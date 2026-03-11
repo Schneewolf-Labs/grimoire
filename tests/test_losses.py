@@ -281,6 +281,7 @@ class TestDPOLoss:
 
     def test_creates_correct_collator(self):
         ref_model = SimpleModel()
+        ref_model.eval()
         loss_fn = DPOLoss(ref_model=ref_model)
         from grimoire.data.preference import PreferenceCollator
         collator = loss_fn.create_collator(pad_token_id=0)
@@ -543,6 +544,7 @@ class TestKTOLoss:
 
     def test_creates_correct_collator(self):
         ref_model = SimpleModel()
+        ref_model.eval()
         loss_fn = KTOLoss(ref_model=ref_model)
         from grimoire.data.kto import KTOCollator
         collator = loss_fn.create_collator(pad_token_id=0)
@@ -672,6 +674,7 @@ class TestIPOLoss:
 
     def test_creates_correct_collator(self):
         ref_model = SimpleModel()
+        ref_model.eval()
         loss_fn = IPOLoss(ref_model=ref_model)
         from grimoire.data.preference import PreferenceCollator
         collator = loss_fn.create_collator(pad_token_id=0)

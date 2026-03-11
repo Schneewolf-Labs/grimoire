@@ -18,6 +18,8 @@ class DPOLoss:
     """
 
     def __init__(self, ref_model, beta=0.1, label_pad_token_id=-100):
+        if ref_model.training:
+            raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
         self.beta = beta
         self.label_pad_token_id = label_pad_token_id
@@ -113,4 +115,4 @@ class DPOLoss:
         gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
         per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
 
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
