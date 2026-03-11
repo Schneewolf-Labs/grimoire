@@ -50,11 +50,13 @@ class KTOLoss:
         # Policy log-probs
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         policy_logps = self._get_batch_logps(logits, labels)
+        del logits
 
         # Reference log-probs (frozen, no grad)
         with torch.no_grad():
             ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
             ref_logps = self._get_batch_logps(ref_logits, labels)
+            del ref_logits
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps
@@ -109,16 +111,14 @@ class KTOLoss:
 
     def _get_batch_logps(self, logits, labels):
         """Average log probability per sequence over response tokens only."""
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].clone()
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
 
         loss_mask = shift_labels != self.label_pad_token_id
-        shift_labels[shift_labels == self.label_pad_token_id] = 0
+        safe_labels = torch.where(loss_mask, shift_labels, 0)
 
-        per_token_logps = torch.gather(
-            F.log_softmax(shift_logits, dim=-1),
-            dim=2,
-            index=shift_labels.unsqueeze(2),
-        ).squeeze(2)
+        # gather + logsumexp avoids materializing the full [batch, seq, vocab] log_softmax tensor
+        gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
+        per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
 
         return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
