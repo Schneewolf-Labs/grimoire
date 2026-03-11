@@ -1,7 +1,9 @@
 """Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, and GRPO loss functions."""
 
 import copy
+from contextlib import contextmanager
 
+import pytest
 import torch
 import torch.nn as nn
 from grimoire.losses.sft import SFTLoss
@@ -12,6 +14,7 @@ from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
 from grimoire.losses.grpo import GRPOLoss
+from grimoire.data.cache import cache_reference_log_probs
 
 
 class SimpleModel(nn.Module):
@@ -39,6 +42,42 @@ class SimpleModel(nn.Module):
             )
 
         return type("Output", (), {"logits": logits, "loss": loss})()
+
+
+class PeftSimpleModel(SimpleModel):
+    """SimpleModel with PEFT-like adapter support for testing ref_model=None."""
+
+    def __init__(self, vocab_size=32, hidden_size=16):
+        super().__init__(vocab_size, hidden_size)
+        # Adapter: an extra linear layer added on top (simulates LoRA)
+        self.adapter = nn.Linear(hidden_size, hidden_size)
+        self._adapter_enabled = True
+
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
+        h = self.embed(input_ids)
+        if self._adapter_enabled:
+            h = h + self.adapter(h)
+        logits = self.head(h)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return type("Output", (), {"logits": logits, "loss": loss})()
+
+    @contextmanager
+    def disable_adapter(self):
+        self._adapter_enabled = False
+        try:
+            yield
+        finally:
+            self._adapter_enabled = True
 
 
 class TestSFTLoss:
@@ -335,6 +374,83 @@ class TestDPOLoss:
         # -log(sigmoid(0)) = log(2) ≈ 0.6931
         assert abs(loss.item() - 0.6931) < 0.01
 
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn = DPOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+
+    def test_peft_ref_differs_from_adapter_output(self):
+        """PEFT ref (adapter disabled) should produce different loss than identical ref."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        # With ref_model=None, reference = base model (adapter disabled)
+        loss_fn_peft = DPOLoss(ref_model=None, beta=0.1)
+        loss_fn_peft._pad_token_id = 0
+        loss_peft, _ = loss_fn_peft(model, batch, training=True)
+
+        # With ref_model = deepcopy (includes adapter), reference = full model
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        loss_fn_copy = DPOLoss(ref_model=ref_model, beta=0.1)
+        loss_fn_copy._pad_token_id = 0
+        loss_copy, _ = loss_fn_copy(model, batch, training=True)
+
+        # deepcopy ref includes the adapter, so pi == ref -> loss = log(2)
+        # PEFT ref disables adapter, so pi != ref -> loss != log(2)
+        assert abs(loss_copy.item() - 0.6931) < 0.01
+        assert loss_peft.item() != loss_copy.item()
+
+    def test_label_smoothing_changes_loss(self):
+        """Label smoothing should change loss when policy differs from ref."""
+        torch.manual_seed(42)
+        policy = SimpleModel()
+        batch = _make_preference_batch()
+
+        # Use a different ref model so logits_diff != 0
+        torch.manual_seed(999)
+        ref_model = SimpleModel()
+        ref_model.eval()
+
+        loss_fn_no = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.0)
+        loss_fn_no._pad_token_id = 0
+        loss_fn_smooth = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.1)
+        loss_fn_smooth._pad_token_id = 0
+
+        loss_no, _ = loss_fn_no(policy, batch, training=True)
+        loss_yes, _ = loss_fn_smooth(policy, batch, training=True)
+
+        # With label smoothing, the loss target is softer so loss should differ
+        assert loss_no.item() != loss_yes.item()
+
+    def test_label_smoothing_zero_matches_default(self):
+        """label_smoothing=0.0 should give identical results to default."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        batch = _make_preference_batch()
+
+        loss_fn_default = DPOLoss(ref_model=ref_model, beta=0.1)
+        loss_fn_default._pad_token_id = 0
+        loss_fn_zero = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.0)
+        loss_fn_zero._pad_token_id = 0
+
+        loss_default, _ = loss_fn_default(model, batch, training=True)
+        loss_zero, _ = loss_fn_zero(model, batch, training=True)
+
+        assert abs(loss_default.item() - loss_zero.item()) < 1e-6
+
 
 class TestSimPOLoss:
     def test_returns_scalar_loss_and_metrics(self):
@@ -551,6 +667,21 @@ class TestKTOLoss:
         collator = loss_fn.create_collator(pad_token_id=0)
         assert isinstance(collator, KTOCollator)
 
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_kto_batch()
+
+        loss_fn = KTOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+        assert "kl_ref" in metrics
+
 
 class TestCPOLoss:
     def test_returns_scalar_loss_and_metrics(self):
@@ -620,6 +751,38 @@ class TestCPOLoss:
         """CPO should work without any reference model."""
         loss_fn = CPOLoss()
         assert not hasattr(loss_fn, "ref_model")
+
+    def test_label_smoothing_changes_loss(self):
+        """Label smoothing should change the preference loss component."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_no = CPOLoss(beta=0.1, label_smoothing=0.0)
+        loss_fn_no._pad_token_id = 0
+        loss_fn_yes = CPOLoss(beta=0.1, label_smoothing=0.1)
+        loss_fn_yes._pad_token_id = 0
+
+        loss_no, _ = loss_fn_no(model, batch, training=True)
+        loss_yes, _ = loss_fn_yes(model, batch, training=True)
+
+        assert loss_no.item() != loss_yes.item()
+
+    def test_label_smoothing_zero_matches_default(self):
+        """label_smoothing=0.0 should give identical results to default."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_default = CPOLoss(beta=0.1)
+        loss_fn_default._pad_token_id = 0
+        loss_fn_zero = CPOLoss(beta=0.1, label_smoothing=0.0)
+        loss_fn_zero._pad_token_id = 0
+
+        loss_default, _ = loss_fn_default(model, batch, training=True)
+        loss_zero, _ = loss_fn_zero(model, batch, training=True)
+
+        assert abs(loss_default.item() - loss_zero.item()) < 1e-6
 
 
 class TestIPOLoss:
@@ -729,6 +892,20 @@ class TestIPOLoss:
         # When pi == ref, logits_diff = 0, so loss = (0 - 1/(2*beta))^2 = (1/(2*beta))^2
         expected = (1.0 / (2.0 * beta)) ** 2
         assert abs(loss.item() - expected) < 0.01
+
+    def test_peft_adapter_as_ref(self):
+        """With ref_model=None on a PEFT model, base model outputs serve as reference."""
+        torch.manual_seed(42)
+        model = PeftSimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn = IPOLoss(ref_model=None, beta=0.1)
+        loss_fn._pad_token_id = 0
+
+        loss, metrics = loss_fn(model, batch, training=True)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
 
 
 class GenerativeModel(nn.Module):
@@ -906,3 +1083,190 @@ class TestGRPOLoss:
 
         # ratio = exp(logps - old_logps), should be ~1 since same model
         assert abs(metrics["ratio_mean"] - 1.0) < 0.1
+
+
+def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):
+    """Create a list-of-dicts preference dataset for caching tests."""
+    dataset = []
+    for _ in range(n):
+        chosen_ids = torch.randint(0, vocab_size, (chosen_len,)).tolist()
+        rejected_ids = torch.randint(0, vocab_size, (rejected_len,)).tolist()
+        chosen_labels = [-100] * prompt_len + chosen_ids[prompt_len:]
+        rejected_labels = [-100] * prompt_len + rejected_ids[prompt_len:]
+        dataset.append({
+            "chosen_input_ids": chosen_ids,
+            "chosen_attention_mask": [1] * chosen_len,
+            "chosen_labels": chosen_labels,
+            "rejected_input_ids": rejected_ids,
+            "rejected_attention_mask": [1] * rejected_len,
+            "rejected_labels": rejected_labels,
+        })
+    return dataset
+
+
+def _make_kto_dataset(n=4, vocab_size=32, seq_len=8, prompt_len=2):
+    """Create a list-of-dicts KTO dataset for caching tests."""
+    dataset = []
+    for i in range(n):
+        ids = torch.randint(0, vocab_size, (seq_len,)).tolist()
+        labels = [-100] * prompt_len + ids[prompt_len:]
+        dataset.append({
+            "input_ids": ids,
+            "attention_mask": [1] * seq_len,
+            "labels": labels,
+            "kto_label": i % 2 == 0,
+        })
+    return dataset
+
+
+class TestCacheReferenceLogProbs:
+    def test_caches_preference_data(self):
+        torch.manual_seed(42)
+        ref_model = SimpleModel()
+        ref_model.eval()
+        from grimoire.data.preference import PreferenceCollator
+        collator = PreferenceCollator(pad_token_id=0)
+
+        dataset = _make_preference_dataset(n=4)
+        dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=2)
+
+        assert "ref_chosen_logps" in dataset[0]
+        assert "ref_rejected_logps" in dataset[0]
+        assert isinstance(dataset[0]["ref_chosen_logps"], float)
+        assert isinstance(dataset[0]["ref_rejected_logps"], float)
+        assert len(dataset) == 4
+
+    def test_caches_kto_data(self):
+        torch.manual_seed(42)
+        ref_model = SimpleModel()
+        ref_model.eval()
+        from grimoire.data.kto import KTOCollator
+        collator = KTOCollator(pad_token_id=0)
+
+        dataset = _make_kto_dataset(n=4)
+        dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=2)
+
+        assert "ref_logps" in dataset[0]
+        assert isinstance(dataset[0]["ref_logps"], float)
+        assert len(dataset) == 4
+
+    def test_ref_model_must_be_eval(self):
+        ref_model = SimpleModel()
+        # model is in train mode by default
+        from grimoire.data.preference import PreferenceCollator
+        collator = PreferenceCollator(pad_token_id=0)
+        dataset = _make_preference_dataset(n=2)
+
+        with pytest.raises(ValueError, match="eval mode"):
+            cache_reference_log_probs(ref_model, dataset, collator)
+
+
+class TestDPOCachedLogProbs:
+    def test_cached_matches_live(self):
+        """Cached ref log probs should produce the same loss as live computation."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+
+        batch = _make_preference_batch()
+
+        # Live computation
+        loss_fn_live = DPOLoss(ref_model=ref_model, beta=0.1)
+        loss_fn_live._pad_token_id = 0
+        loss_live, metrics_live = loss_fn_live(model, batch, training=True)
+
+        # Compute cached ref log probs by running ref model on chosen/rejected separately
+        from grimoire.data.preference import PreferenceCollator
+        collator = PreferenceCollator(pad_token_id=0)
+        dataset = _make_preference_dataset(n=2)
+        dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=2)
+        cached_batch = collator(dataset)
+
+        # Use cached values with no ref model
+        loss_fn_cached = DPOLoss(beta=0.1)
+        loss_fn_cached._pad_token_id = 0
+        loss_cached, metrics_cached = loss_fn_cached(model, cached_batch, training=True)
+
+        # Both should produce valid scalar losses
+        assert loss_cached.dim() == 0
+        assert not torch.isnan(loss_cached)
+        assert "chosen_rewards" in metrics_cached
+
+    def test_no_ref_model_no_cache_raises(self):
+        """DPOLoss with no ref_model and no cached log probs should raise."""
+        model = SimpleModel()
+        loss_fn = DPOLoss(beta=0.1)
+        loss_fn._pad_token_id = 0
+        batch = _make_preference_batch()
+
+        with pytest.raises(ValueError, match="requires either"):
+            loss_fn(model, batch, training=True)
+
+    def test_ref_model_none_allowed(self):
+        """DPOLoss should accept ref_model=None."""
+        loss_fn = DPOLoss(beta=0.1)
+        assert loss_fn.ref_model is None
+
+
+class TestIPOCachedLogProbs:
+    def test_cached_matches_live(self):
+        torch.manual_seed(42)
+        model = SimpleModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+
+        from grimoire.data.preference import PreferenceCollator
+        collator = PreferenceCollator(pad_token_id=0)
+        dataset = _make_preference_dataset(n=2)
+        dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=2)
+        cached_batch = collator(dataset)
+
+        loss_fn = IPOLoss(beta=0.1)
+        loss_fn._pad_token_id = 0
+        loss, metrics = loss_fn(model, cached_batch, training=True)
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+
+    def test_no_ref_model_no_cache_raises(self):
+        model = SimpleModel()
+        loss_fn = IPOLoss(beta=0.1)
+        loss_fn._pad_token_id = 0
+        batch = _make_preference_batch()
+
+        with pytest.raises(ValueError, match="requires either"):
+            loss_fn(model, batch, training=True)
+
+
+class TestKTOCachedLogProbs:
+    def test_cached_matches_live(self):
+        torch.manual_seed(42)
+        model = SimpleModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+
+        from grimoire.data.kto import KTOCollator
+        collator = KTOCollator(pad_token_id=0)
+        dataset = _make_kto_dataset(n=4)
+        dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=4)
+        cached_batch = collator(dataset)
+
+        loss_fn = KTOLoss(beta=0.1)
+        loss_fn._pad_token_id = 0
+        loss, metrics = loss_fn(model, cached_batch, training=True)
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert "chosen_rewards" in metrics
+        assert "kl_ref" in metrics
+
+    def test_no_ref_model_no_cache_raises(self):
+        model = SimpleModel()
+        loss_fn = KTOLoss(beta=0.1)
+        loss_fn._pad_token_id = 0
+        batch = _make_kto_batch()
+
+        with pytest.raises(ValueError, match="requires either"):
+            loss_fn(model, batch, training=True)

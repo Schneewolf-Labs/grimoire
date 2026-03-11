@@ -172,6 +172,62 @@ class TestKTOCollator:
         assert (batch["attention_mask"] == 1).all()
 
 
+class TestPreferenceCollatorCachedRefLogps:
+    def test_passes_through_cached_ref_logps(self):
+        collator = PreferenceCollator(pad_token_id=0)
+        features = [
+            {
+                "chosen_input_ids": [1, 2, 3], "chosen_attention_mask": [1, 1, 1], "chosen_labels": [-100, 2, 3],
+                "rejected_input_ids": [1, 4], "rejected_attention_mask": [1, 1], "rejected_labels": [-100, 4],
+                "ref_chosen_logps": -1.5, "ref_rejected_logps": -2.0,
+            },
+            {
+                "chosen_input_ids": [5, 6], "chosen_attention_mask": [1, 1], "chosen_labels": [-100, 6],
+                "rejected_input_ids": [5, 7, 8], "rejected_attention_mask": [1, 1, 1], "rejected_labels": [-100, 7, 8],
+                "ref_chosen_logps": -1.2, "ref_rejected_logps": -2.5,
+            },
+        ]
+        batch = collator(features)
+
+        assert "ref_chosen_logps" in batch
+        assert "ref_rejected_logps" in batch
+        assert batch["ref_chosen_logps"].tolist() == pytest.approx([-1.5, -1.2])
+        assert batch["ref_rejected_logps"].tolist() == pytest.approx([-2.0, -2.5])
+
+    def test_no_ref_logps_when_not_present(self):
+        collator = PreferenceCollator(pad_token_id=0)
+        features = [
+            {
+                "chosen_input_ids": [1, 2], "chosen_attention_mask": [1, 1], "chosen_labels": [-100, 2],
+                "rejected_input_ids": [1, 3], "rejected_attention_mask": [1, 1], "rejected_labels": [-100, 3],
+            },
+        ]
+        batch = collator(features)
+        assert "ref_chosen_logps" not in batch
+        assert "ref_rejected_logps" not in batch
+
+
+class TestKTOCollatorCachedRefLogps:
+    def test_passes_through_cached_ref_logps(self):
+        collator = KTOCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [-100, 2, 3], "kto_label": True, "ref_logps": -1.5},
+            {"input_ids": [4, 5], "attention_mask": [1, 1], "labels": [-100, 5], "kto_label": False, "ref_logps": -2.0},
+        ]
+        batch = collator(features)
+
+        assert "ref_logps" in batch
+        assert batch["ref_logps"].tolist() == pytest.approx([-1.5, -2.0])
+
+    def test_no_ref_logps_when_not_present(self):
+        collator = KTOCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2], "kto_label": True},
+        ]
+        batch = collator(features)
+        assert "ref_logps" not in batch
+
+
 class TestTokenizeKTO:
     @pytest.fixture
     def mock_tokenizer(self):
