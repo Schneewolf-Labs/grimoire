@@ -33,6 +33,15 @@ class PreferenceCollator:
             batch["rejected_attention_mask"][i, :r_len] = torch.tensor(f["rejected_attention_mask"], dtype=torch.long)
             batch["rejected_labels"][i, :r_len] = torch.tensor(f["rejected_labels"], dtype=torch.long)
 
+        # Pass through cached reference log probs when present
+        if "ref_chosen_logps" in features[0]:
+            batch["ref_chosen_logps"] = torch.tensor(
+                [f["ref_chosen_logps"] for f in features]
+            )
+            batch["ref_rejected_logps"] = torch.tensor(
+                [f["ref_rejected_logps"] for f in features]
+            )
+
         return batch
 
 

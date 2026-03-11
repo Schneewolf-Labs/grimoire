@@ -21,8 +21,9 @@ class CPOLoss:
     a contrastive preference term (theoretically cleaner than ORPO's odds ratio).
     """
 
-    def __init__(self, beta=0.1, label_pad_token_id=-100):
+    def __init__(self, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100):
         self.beta = beta
+        self.label_smoothing = label_smoothing
         self.label_pad_token_id = label_pad_token_id
         self._pad_token_id = 0
 
@@ -61,8 +62,13 @@ class CPOLoss:
         rejected_logps = all_logps[len_chosen:]
 
         # Preference loss: -log sigmoid(beta * (avg_logp_chosen - avg_logp_rejected))
+        # With label smoothing: -(1-eps)*logsigmoid(x) - eps*logsigmoid(-x)
         logits_diff = chosen_logps - rejected_logps
-        preference_loss = -F.logsigmoid(self.beta * logits_diff).mean()
+        scaled_diff = self.beta * logits_diff
+        preference_loss = -(
+            (1 - self.label_smoothing) * F.logsigmoid(scaled_diff)
+            + self.label_smoothing * F.logsigmoid(-scaled_diff)
+        ).mean()
 
         loss = nll_loss + self.beta * preference_loss
 

@@ -24,12 +24,20 @@ class KTOCollator:
 
         kto_labels = torch.tensor([f["kto_label"] for f in features], dtype=torch.bool)
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "kto_label": kto_labels,
         }
+
+        # Pass through cached reference log probs when present
+        if "ref_logps" in features[0]:
+            batch["ref_logps"] = torch.tensor(
+                [f["ref_logps"] for f in features]
+            )
+
+        return batch
 
 
 def tokenize_kto(

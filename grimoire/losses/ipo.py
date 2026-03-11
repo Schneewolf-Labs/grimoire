@@ -47,17 +47,23 @@ class IPOLoss:
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
-        # Reference log-probs (frozen, no grad)
-        with torch.no_grad():
-            if self.ref_model is not None:
-                ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-            else:
-                with model.disable_adapter():
-                    ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-            ref_logps = self._get_batch_logps(ref_logits, labels)
-            del ref_logits
-            ref_chosen_logps = ref_logps[:len_chosen]
-            ref_rejected_logps = ref_logps[len_chosen:]
+        # Reference log-probs: use cached values if available, else compute
+        if "ref_chosen_logps" in batch:
+            ref_chosen_logps = batch["ref_chosen_logps"].to(chosen_logps.device)
+            ref_rejected_logps = batch["ref_rejected_logps"].to(chosen_logps.device)
+        else:
+            with torch.no_grad():
+                if self.ref_model is not None:
+                    ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                elif hasattr(model, "disable_adapter"):
+                    with model.disable_adapter():
+                        ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                else:
+                    raise ValueError("IPOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
+                ref_logps = self._get_batch_logps(ref_logits, labels)
+                del ref_logits
+                ref_chosen_logps = ref_logps[:len_chosen]
+                ref_rejected_logps = ref_logps[len_chosen:]
 
         # IPO loss: ((log_ratio_chosen - log_ratio_rejected) - 1/(2*beta))^2
         pi_logratios = chosen_logps - rejected_logps
