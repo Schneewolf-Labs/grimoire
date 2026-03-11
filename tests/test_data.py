@@ -305,6 +305,116 @@ class TestGRPOCollator:
         assert (batch["attention_mask"] == 1).all()
 
 
+class TestTokenizeSFTTruncation:
+    @pytest.fixture
+    def mock_tokenizer(self):
+        class MockTokenizer:
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return MockTokenizer()
+
+    def test_text_field_truncates_to_max_length(self, mock_tokenizer):
+        example = {"text": "ABCDEFGHIJ"}  # 10 chars
+        result = tokenize_sft(example, mock_tokenizer, max_length=5, text_field="text")
+
+        assert len(result["input_ids"]) == 5
+        assert len(result["labels"]) == 5
+
+    def test_prompt_response_truncates_combined(self, mock_tokenizer):
+        # prompt=5 chars, response=5 chars, max_length=7 → truncated to 7 total
+        example = {"prompt": "ABCDE", "response": "FGHIJ"}
+        result = tokenize_sft(
+            example, mock_tokenizer, max_length=7, prompt_field="prompt", response_field="response"
+        )
+
+        assert len(result["input_ids"]) == 7
+        assert len(result["labels"]) == 7
+
+    def test_only_prompt_field_raises_without_response(self, mock_tokenizer):
+        with pytest.raises(ValueError):
+            tokenize_sft({"prompt": "hello"}, mock_tokenizer, prompt_field="prompt")
+
+
+class TestTokenizePreferenceCustomFields:
+    @pytest.fixture
+    def mock_tokenizer(self):
+        class MockTokenizer:
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return MockTokenizer()
+
+    def test_custom_field_names(self, mock_tokenizer):
+        example = {"q": "AB", "win": "CD", "lose": "EF"}
+        result = tokenize_preference(
+            example, mock_tokenizer,
+            prompt_field="q", chosen_field="win", rejected_field="lose"
+        )
+
+        assert "chosen_input_ids" in result
+        assert "rejected_input_ids" in result
+        # prompt "AB" = 2 tokens → first 2 labels masked
+        assert result["chosen_labels"][:2] == [-100, -100]
+        assert result["rejected_labels"][:2] == [-100, -100]
+
+    def test_max_prompt_length_limits_masking(self, mock_tokenizer):
+        # prompt = "ABCD" (4 chars), max_prompt_length=2 → only 2 tokens masked
+        example = {"prompt": "ABCD", "chosen": "EF", "rejected": "GH"}
+        result = tokenize_preference(
+            example, mock_tokenizer, max_prompt_length=2
+        )
+
+        # Only first 2 tokens should be masked (not all 4 prompt tokens)
+        assert result["chosen_labels"][:2] == [-100, -100]
+        assert result["chosen_labels"][2] != -100
+
+    def test_truncates_to_max_length(self, mock_tokenizer):
+        example = {"prompt": "AB", "chosen": "CDEFGHIJ", "rejected": "KLMNOPQR"}
+        result = tokenize_preference(example, mock_tokenizer, max_length=5)
+
+        assert len(result["chosen_input_ids"]) == 5
+        assert len(result["rejected_input_ids"]) == 5
+
+
+class TestTokenizeKTOCustomFields:
+    @pytest.fixture
+    def mock_tokenizer(self):
+        class MockTokenizer:
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return MockTokenizer()
+
+    def test_custom_field_names(self, mock_tokenizer):
+        example = {"question": "AB", "answer": "CD", "good": True}
+        result = tokenize_kto(
+            example, mock_tokenizer,
+            prompt_field="question", response_field="answer", label_field="good"
+        )
+
+        assert "input_ids" in result
+        assert "kto_label" in result
+        assert result["kto_label"] is True
+
+    def test_truncates_to_max_length(self, mock_tokenizer):
+        example = {"prompt": "AB", "response": "CDEFGHIJ", "label": False}
+        result = tokenize_kto(example, mock_tokenizer, max_length=5)
+
+        assert len(result["input_ids"]) == 5
+        assert len(result["labels"]) == 5
+
+    def test_label_converts_to_bool(self, mock_tokenizer):
+        # label_field value gets cast to bool
+        example = {"prompt": "A", "response": "B", "label": 1}
+        result = tokenize_kto(example, mock_tokenizer)
+        assert result["kto_label"] is True
+
+        example2 = {"prompt": "A", "response": "B", "label": 0}
+        result2 = tokenize_kto(example2, mock_tokenizer)
+        assert result2["kto_label"] is False
+
+
 class TestTokenizeGRPO:
     @pytest.fixture
     def mock_tokenizer(self):
