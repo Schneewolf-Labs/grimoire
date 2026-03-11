@@ -22,8 +22,8 @@ class KTOLoss:
     Requires a frozen reference model to compute baseline log-probabilities.
     """
 
-    def __init__(self, ref_model, beta=0.1, lambda_d=1.0, lambda_u=1.0, label_pad_token_id=-100):
-        if ref_model.training:
+    def __init__(self, ref_model=None, beta=0.1, lambda_d=1.0, lambda_u=1.0, label_pad_token_id=-100):
+        if ref_model is not None and ref_model.training:
             raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
         self.beta = beta
@@ -52,11 +52,16 @@ class KTOLoss:
         policy_logps = self._get_batch_logps(logits, labels)
         del logits
 
-        # Reference log-probs (frozen, no grad)
-        with torch.no_grad():
-            ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-            ref_logps = self._get_batch_logps(ref_logits, labels)
-            del ref_logits
+        # Reference log-probs: use cached values if available, else compute
+        if "ref_logps" in batch:
+            ref_logps = batch["ref_logps"].to(policy_logps.device)
+        elif self.ref_model is not None:
+            with torch.no_grad():
+                ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                ref_logps = self._get_batch_logps(ref_logits, labels)
+                del ref_logits
+        else:
+            raise ValueError("KTOLoss requires either a ref_model or cached ref log probs in the batch")
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps
