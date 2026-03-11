@@ -17,11 +17,12 @@ class DPOLoss:
     that the policy is optimized against.
     """
 
-    def __init__(self, ref_model=None, beta=0.1, label_pad_token_id=-100):
+    def __init__(self, ref_model=None, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100):
         if ref_model is not None and ref_model.training:
             raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
         self.beta = beta
+        self.label_smoothing = label_smoothing
         self.label_pad_token_id = label_pad_token_id
         self._pad_token_id = 0
 
@@ -62,10 +63,14 @@ class DPOLoss:
             raise ValueError("DPOLoss requires either a ref_model or cached ref log probs in the batch")
 
         # DPO loss: -log sigmoid(beta * (pi_logratio - ref_logratio))
+        # With label smoothing: -(1-eps)*logsigmoid(x) - eps*logsigmoid(-x)
         pi_logratios = chosen_logps - rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
-        logits_diff = pi_logratios - ref_logratios
-        loss = -F.logsigmoid(self.beta * logits_diff).mean()
+        logits_diff = self.beta * (pi_logratios - ref_logratios)
+        loss = -(
+            (1 - self.label_smoothing) * F.logsigmoid(logits_diff)
+            + self.label_smoothing * F.logsigmoid(-logits_diff)
+        ).mean()
 
         # Implicit rewards: beta * (log pi(y|x) - log pi_ref(y|x))
         chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps).detach()
@@ -76,7 +81,7 @@ class DPOLoss:
             "rejected_rewards": rejected_rewards.mean().item(),
             "reward_margin": (chosen_rewards - rejected_rewards).mean().item(),
             "reward_accuracy": (chosen_rewards > rejected_rewards).float().mean().item(),
-            "log_odds_ratio": logits_diff.detach().mean().item(),
+            "log_odds_ratio": (pi_logratios - ref_logratios).detach().mean().item(),
         }
 
         return loss, metrics

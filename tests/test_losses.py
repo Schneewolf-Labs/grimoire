@@ -336,6 +336,46 @@ class TestDPOLoss:
         # -log(sigmoid(0)) = log(2) ≈ 0.6931
         assert abs(loss.item() - 0.6931) < 0.01
 
+    def test_label_smoothing_changes_loss(self):
+        """Label smoothing should change loss when policy differs from ref."""
+        torch.manual_seed(42)
+        policy = SimpleModel()
+        batch = _make_preference_batch()
+
+        # Use a different ref model so logits_diff != 0
+        torch.manual_seed(999)
+        ref_model = SimpleModel()
+        ref_model.eval()
+
+        loss_fn_no = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.0)
+        loss_fn_no._pad_token_id = 0
+        loss_fn_smooth = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.1)
+        loss_fn_smooth._pad_token_id = 0
+
+        loss_no, _ = loss_fn_no(policy, batch, training=True)
+        loss_yes, _ = loss_fn_smooth(policy, batch, training=True)
+
+        # With label smoothing, the loss target is softer so loss should differ
+        assert loss_no.item() != loss_yes.item()
+
+    def test_label_smoothing_zero_matches_default(self):
+        """label_smoothing=0.0 should give identical results to default."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        batch = _make_preference_batch()
+
+        loss_fn_default = DPOLoss(ref_model=ref_model, beta=0.1)
+        loss_fn_default._pad_token_id = 0
+        loss_fn_zero = DPOLoss(ref_model=ref_model, beta=0.1, label_smoothing=0.0)
+        loss_fn_zero._pad_token_id = 0
+
+        loss_default, _ = loss_fn_default(model, batch, training=True)
+        loss_zero, _ = loss_fn_zero(model, batch, training=True)
+
+        assert abs(loss_default.item() - loss_zero.item()) < 1e-6
+
 
 class TestSimPOLoss:
     def test_returns_scalar_loss_and_metrics(self):
@@ -621,6 +661,38 @@ class TestCPOLoss:
         """CPO should work without any reference model."""
         loss_fn = CPOLoss()
         assert not hasattr(loss_fn, "ref_model")
+
+    def test_label_smoothing_changes_loss(self):
+        """Label smoothing should change the preference loss component."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_no = CPOLoss(beta=0.1, label_smoothing=0.0)
+        loss_fn_no._pad_token_id = 0
+        loss_fn_yes = CPOLoss(beta=0.1, label_smoothing=0.1)
+        loss_fn_yes._pad_token_id = 0
+
+        loss_no, _ = loss_fn_no(model, batch, training=True)
+        loss_yes, _ = loss_fn_yes(model, batch, training=True)
+
+        assert loss_no.item() != loss_yes.item()
+
+    def test_label_smoothing_zero_matches_default(self):
+        """label_smoothing=0.0 should give identical results to default."""
+        torch.manual_seed(42)
+        model = SimpleModel()
+        batch = _make_preference_batch()
+
+        loss_fn_default = CPOLoss(beta=0.1)
+        loss_fn_default._pad_token_id = 0
+        loss_fn_zero = CPOLoss(beta=0.1, label_smoothing=0.0)
+        loss_fn_zero._pad_token_id = 0
+
+        loss_default, _ = loss_fn_default(model, batch, training=True)
+        loss_zero, _ = loss_fn_zero(model, batch, training=True)
+
+        assert abs(loss_default.item() - loss_zero.item()) < 1e-6
 
 
 class TestIPOLoss:
