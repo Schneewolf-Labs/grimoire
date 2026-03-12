@@ -6,9 +6,10 @@ setup(
     description="Simple, multi-GPU LLM fine-tuning library",
     python_requires=">=3.10",
     packages=find_packages(include=["grimoire*"]),
+    # NOTE: torch is intentionally excluded — it's version/CUDA-specific and
+    # users must install it themselves. Using --force-reinstall with torch in
+    # install_requires will nuke your entire CUDA stack.
     install_requires=[
-        "torch>=2.0.0",
-        "transformers>=4.36.0",
         "accelerate>=0.24.0",
         "peft>=0.6.0",
         "datasets>=2.14.0",
