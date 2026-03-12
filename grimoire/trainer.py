@@ -77,7 +77,14 @@ class GrimoireTrainer:
         # Initialize accelerator
         tracker_kwargs = {}
         if config.log_with == "wandb":
-            tracker_kwargs["wandb"] = {"name": config.run_name} if config.run_name else {}
+            wandb_kwargs = {}
+            if config.run_name:
+                wandb_kwargs["name"] = config.run_name
+            if config.wandb_tags:
+                wandb_kwargs["tags"] = config.wandb_tags
+            if config.wandb_notes:
+                wandb_kwargs["notes"] = config.wandb_notes
+            tracker_kwargs["wandb"] = wandb_kwargs
 
         self.accelerator = Accelerator(
             mixed_precision=config.mixed_precision,
