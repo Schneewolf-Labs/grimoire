@@ -12,6 +12,7 @@ setup(
         "accelerate>=0.24.0",
         "peft>=0.6.0",
         "datasets>=2.14.0",
+        "tqdm>=4.60.0",
     ],
     extras_require={
         "quantization": ["bitsandbytes>=0.41.0"],

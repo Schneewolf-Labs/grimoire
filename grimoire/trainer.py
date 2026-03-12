@@ -6,6 +6,7 @@ import logging
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from transformers import get_scheduler
@@ -182,6 +183,15 @@ class GrimoireTrainer:
         starting_epoch = self.global_step // num_update_steps_per_epoch if self.global_step > 0 else 0
         resume_step_in_epoch = self.global_step - (starting_epoch * num_update_steps_per_epoch)
 
+        # Progress bar (main process only)
+        progress_bar = tqdm(
+            total=self.max_steps,
+            initial=self.global_step,
+            desc="Training",
+            disable=not self.accelerator.is_main_process,
+            dynamic_ncols=True,
+        )
+
         for epoch in range(starting_epoch, config.num_epochs):
             self.current_epoch = epoch
             self._fire("on_epoch_begin", epoch=epoch)
@@ -216,12 +226,16 @@ class GrimoireTrainer:
                     steps_in_epoch += 1
                     running_loss += loss.detach().item()
 
+                    # Update progress bar
+                    avg_loss = running_loss / steps_in_epoch
+                    lr = self.lr_scheduler.get_last_lr()[0]
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+
                     self._fire("on_step_end", step=self.global_step, loss=loss.item(), metrics=metrics)
 
                     # Logging
                     if self.global_step % config.logging_steps == 0:
-                        avg_loss = running_loss / steps_in_epoch
-                        lr = self.lr_scheduler.get_last_lr()[0]
                         progress = self.global_step / self.max_steps
                         log_metrics = {
                             "train/loss": avg_loss,
@@ -259,6 +273,7 @@ class GrimoireTrainer:
             if self.eval_dataloader:
                 self.evaluate()
 
+        progress_bar.close()
         self._fire("on_train_end")
 
         if config.log_with:
@@ -396,7 +411,7 @@ class GrimoireTrainer:
         if self.config.log_with:
             self.accelerator.log(metrics, step=self.global_step)
         if self.accelerator.is_main_process:
-            parts = [f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()]
+            parts = [f"{k}: {_fmt(v)}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()]
             logger.info(f"[step {self.global_step}] {' | '.join(parts)}")
 
     def _log_info(self, msg):
@@ -408,6 +423,13 @@ class GrimoireTrainer:
             fn = getattr(cb, event, None)
             if fn:
                 fn(self, **kwargs)
+
+
+def _fmt(v):
+    """Format a float for logging — use scientific notation for very small values."""
+    if abs(v) < 1e-3 and v != 0.0:
+        return f"{v:.2e}"
+    return f"{v:.4f}"
 
 
 def _config_to_dict(config):
