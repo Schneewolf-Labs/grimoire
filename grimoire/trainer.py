@@ -284,6 +284,8 @@ class GrimoireTrainer:
     @torch.no_grad()
     def evaluate(self):
         """Run evaluation loop and return metrics."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}

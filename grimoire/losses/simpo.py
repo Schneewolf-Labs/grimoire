@@ -68,6 +68,7 @@ class SimPOLoss:
             input_ids=batch["chosen_input_ids"],
             attention_mask=batch["chosen_attention_mask"],
             labels=batch["chosen_labels"],
+            use_cache=False,
         )
         return outputs.loss, {}
 

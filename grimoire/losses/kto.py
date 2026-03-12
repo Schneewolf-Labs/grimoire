@@ -115,6 +115,7 @@ class KTOLoss:
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
+            use_cache=False,
         )
         return outputs.loss, {}
 
