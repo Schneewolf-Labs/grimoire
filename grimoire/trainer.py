@@ -291,8 +291,6 @@ class GrimoireTrainer:
     @torch.no_grad()
     def evaluate(self):
         """Run evaluation loop and return metrics."""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}
@@ -305,11 +303,13 @@ class GrimoireTrainer:
             loss = self.accelerator.reduce(loss, reduction="mean")
             total_loss += loss.item()
 
-            # Reduce metrics across all processes
-            for k, v in metrics.items():
-                v_tensor = torch.tensor(v, device=self.accelerator.device)
-                v_reduced = self.accelerator.reduce(v_tensor, reduction="mean")
-                total_metrics[k] = total_metrics.get(k, 0.0) + v_reduced.item()
+            # Reduce metrics across all processes (batched into single tensor)
+            if metrics:
+                keys = sorted(metrics.keys())
+                vals = torch.tensor([metrics[k] for k in keys], device=self.accelerator.device)
+                vals = self.accelerator.reduce(vals, reduction="mean")
+                for k, v in zip(keys, vals):
+                    total_metrics[k] = total_metrics.get(k, 0.0) + v.item()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)

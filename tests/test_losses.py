@@ -7,7 +7,8 @@ import pytest
 import torch
 import torch.nn as nn
 from grimoire.losses.sft import SFTLoss
-from grimoire.losses.orpo import ORPOLoss, _pad_dim1
+from grimoire.losses.orpo import ORPOLoss
+from grimoire.losses.utils import pad_dim1 as _pad_dim1
 from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss

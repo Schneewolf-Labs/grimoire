@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .orpo import _pad_dim1
+from .utils import get_batch_logps, concatenate_preference
 
 
 class DPOLoss:
@@ -43,7 +43,7 @@ class DPOLoss:
 
         # Policy log-probs
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        all_logps = self._get_batch_logps(logits, labels)
+        all_logps = get_batch_logps(logits, labels, self.label_pad_token_id)
         del logits
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
@@ -63,7 +63,7 @@ class DPOLoss:
                 else:
                     raise ValueError("DPOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
                 del input_ids, attention_mask  # Free concatenated tensors
-                ref_logps = self._get_batch_logps(ref_logits, labels)
+                ref_logps = get_batch_logps(ref_logits, labels, self.label_pad_token_id)
                 del ref_logits, labels
                 ref_chosen_logps = ref_logps[:len_chosen]
                 ref_rejected_logps = ref_logps[len_chosen:]
@@ -104,35 +104,8 @@ class DPOLoss:
 
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
-        max_len = max(batch["chosen_input_ids"].size(1), batch["rejected_input_ids"].size(1))
-
-        input_ids = torch.cat([
-            _pad_dim1(batch["chosen_input_ids"], max_len, self._pad_token_id),
-            _pad_dim1(batch["rejected_input_ids"], max_len, self._pad_token_id),
-        ], dim=0)
-
-        attention_mask = torch.cat([
-            _pad_dim1(batch["chosen_attention_mask"], max_len, 0),
-            _pad_dim1(batch["rejected_attention_mask"], max_len, 0),
-        ], dim=0)
-
-        labels = torch.cat([
-            _pad_dim1(batch["chosen_labels"], max_len, self.label_pad_token_id),
-            _pad_dim1(batch["rejected_labels"], max_len, self.label_pad_token_id),
-        ], dim=0)
-
-        return input_ids, attention_mask, labels
+        return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
 
     def _get_batch_logps(self, logits, labels):
         """Average log probability per sequence over response tokens only."""
-        shift_logits = logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-
-        loss_mask = shift_labels != self.label_pad_token_id
-        safe_labels = torch.where(loss_mask, shift_labels, 0)
-
-        # gather + logsumexp avoids materializing the full [batch, seq, vocab] log_softmax tensor
-        gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
-        per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
-
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
+        return get_batch_logps(logits, labels, self.label_pad_token_id)
