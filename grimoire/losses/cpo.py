@@ -43,6 +43,7 @@ class CPOLoss:
         input_ids, attention_mask, labels = self._concatenate(batch)
 
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        del input_ids, attention_mask  # Free concatenated tensors
 
         # SFT loss on chosen (using model's cross-entropy) — compute before freeing logits
         chosen_logits = logits[:len_chosen]

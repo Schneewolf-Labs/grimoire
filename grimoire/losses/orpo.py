@@ -37,6 +37,7 @@ class ORPOLoss:
         input_ids, attention_mask, labels = self._concatenate(batch)
 
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        del input_ids, attention_mask  # Free concatenated tensors
         logits = outputs.logits
 
         # NLL loss on chosen response tokens only
@@ -44,7 +45,7 @@ class ORPOLoss:
 
         # Log probabilities (average per sequence for length-invariance)
         all_logps = self._get_batch_logps(logits, labels)
-        del logits
+        del logits, labels
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 

@@ -90,8 +90,10 @@ class GRPOLoss:
         completion_texts = self.tokenizer.batch_decode(
             generated[:, prompt_len:], skip_special_tokens=True,
         )
+        del repeated_ids, repeated_mask  # Free [B*G, prompt_len] tensors
 
         rewards = self.reward_fn(prompt_texts, completion_texts)  # list[float] or tensor
+        del prompt_texts, completion_texts  # Free decoded strings
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32, device=input_ids.device)
         rewards = rewards.to(input_ids.device)  # [B*G]
@@ -101,6 +103,10 @@ class GRPOLoss:
         group_mean = rewards_grouped.mean(dim=1, keepdim=True)
         group_std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
         advantages = ((rewards_grouped - group_mean) / group_std).view(B * G)  # [B*G]
+        del rewards_grouped, group_mean, group_std
+
+        # Capture sequence length before tensors are freed
+        completion_length = gen_labels.size(1) - prompt_len
 
         # 4. Old log-probs (from generation policy, no grad)
         with torch.no_grad():
@@ -118,8 +124,9 @@ class GRPOLoss:
             attention_mask=gen_attention_mask,
             use_cache=False,
         ).logits
+        del generated, gen_attention_mask  # Free [B*G, seq_len] tensors
         logps = self._get_batch_logps(logits, gen_labels)  # [B*G]
-        del logits
+        del logits, gen_labels
 
         # 6. Clipped REINFORCE loss
         ratio = torch.exp(logps - old_logps.detach())
@@ -143,7 +150,7 @@ class GRPOLoss:
             "kl": kl.detach().item(),
             "policy_loss": policy_loss.detach().item(),
             "ratio_mean": ratio.detach().mean().item(),
-            "completion_length": (generated.size(1) - prompt_len),
+            "completion_length": completion_length,
         }
 
         return loss, metrics
