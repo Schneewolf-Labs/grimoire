@@ -25,12 +25,25 @@ class SFTCollator:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-def tokenize_sft(example, tokenizer, max_length=2048, text_field=None, prompt_field=None, response_field=None):
+def tokenize_sft(
+    example,
+    tokenizer,
+    max_length=2048,
+    max_prompt_length=None,
+    text_field=None,
+    prompt_field=None,
+    response_field=None,
+):
     """Tokenize a single example for SFT training.
 
     Two modes:
       1. text_field: tokenize a single text column, all tokens contribute to loss
       2. prompt_field + response_field: concatenate, mask prompt tokens in labels
+
+    Args:
+        max_length: Maximum total sequence length (prompt + response).
+        max_prompt_length: Maximum prompt length in tokens. Longer prompts are
+            truncated so more of the response is preserved for training.
 
     Use with dataset.map():
         dataset = dataset.map(
@@ -52,6 +65,8 @@ def tokenize_sft(example, tokenizer, max_length=2048, text_field=None, prompt_fi
 
         prompt_tokens = tokenizer(prompt, add_special_tokens=False)
         prompt_len = len(prompt_tokens["input_ids"])
+        if max_prompt_length:
+            prompt_len = min(prompt_len, max_prompt_length)
 
         tokens = tokenizer(prompt + response, max_length=max_length, truncation=True)
 

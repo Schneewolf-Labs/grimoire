@@ -44,6 +44,7 @@ def tokenize_kto(
     example,
     tokenizer,
     max_length=2048,
+    max_prompt_length=None,
     prompt_field="prompt",
     response_field="response",
     label_field="label",
@@ -52,6 +53,11 @@ def tokenize_kto(
 
     Each example has a prompt, a response, and a boolean label indicating
     whether the response is desirable (True) or undesirable (False).
+
+    Args:
+        max_length: Maximum total sequence length (prompt + response).
+        max_prompt_length: Maximum prompt length in tokens. Longer prompts are
+            truncated so more of the response is preserved for training.
 
     Use with dataset.map():
         dataset = dataset.map(
@@ -64,6 +70,8 @@ def tokenize_kto(
 
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
     prompt_len = len(prompt_tokens["input_ids"])
+    if max_prompt_length:
+        prompt_len = min(prompt_len, max_prompt_length)
 
     tokens = tokenizer(prompt + response, max_length=max_length, truncation=True)
 
