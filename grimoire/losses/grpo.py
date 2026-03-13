@@ -1,6 +1,7 @@
 import torch
 
 from ..data.grpo import GRPOCollator
+from .utils import get_batch_logps
 
 
 class GRPOLoss:
@@ -96,7 +97,8 @@ class GRPOLoss:
         del prompt_texts, completion_texts  # Free decoded strings
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32, device=input_ids.device)
-        rewards = rewards.to(input_ids.device)  # [B*G]
+        elif rewards.device != input_ids.device:
+            rewards = rewards.to(input_ids.device)  # [B*G]
 
         # 3. Group-relative advantages
         rewards_grouped = rewards.view(B, G)
@@ -115,7 +117,7 @@ class GRPOLoss:
                 attention_mask=gen_attention_mask,
                 use_cache=False,
             ).logits
-            old_logps = self._get_batch_logps(old_logits, gen_labels)  # [B*G]
+            old_logps = get_batch_logps(old_logits, gen_labels, self.label_pad_token_id)  # [B*G]
             del old_logits
 
         # 5. Policy log-probs (WITH grad)
@@ -125,7 +127,7 @@ class GRPOLoss:
             use_cache=False,
         ).logits
         del generated, gen_attention_mask  # Free [B*G, seq_len] tensors
-        logps = self._get_batch_logps(logits, gen_labels)  # [B*G]
+        logps = get_batch_logps(logits, gen_labels, self.label_pad_token_id)  # [B*G]
         del logits, gen_labels
 
         # 6. Clipped REINFORCE loss
@@ -162,14 +164,4 @@ class GRPOLoss:
 
     def _get_batch_logps(self, logits, labels):
         """Average log probability per sequence over response tokens only."""
-        shift_logits = logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-
-        loss_mask = shift_labels != self.label_pad_token_id
-        safe_labels = torch.where(loss_mask, shift_labels, 0)
-
-        # gather + logsumexp avoids materializing the full [batch, seq, vocab] log_softmax tensor
-        gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
-        per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
-
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
+        return get_batch_logps(logits, labels, self.label_pad_token_id)
