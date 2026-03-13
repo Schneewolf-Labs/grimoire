@@ -219,13 +219,17 @@ class GrimoireTrainer:
             for step, batch in enumerate(active_dataloader):
                 with self.accelerator.accumulate(self.model):
                     loss, metrics = self.loss_fn(self.model, batch, training=True)
+                    del batch  # Free input tensors before backward
                     self.accelerator.backward(loss)
 
                     if config.max_grad_norm and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), config.max_grad_norm)
 
                     self.optimizer.step()
-                    self.lr_scheduler.step()
+                    # Only step LR when the optimizer actually updated —
+                    # fp16 GradScaler may skip steps on inf/nan gradients
+                    if not self.accelerator.optimizer_step_was_skipped:
+                        self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
                 # Only count actual optimization steps (after gradient accumulation)
@@ -336,6 +340,12 @@ class GrimoireTrainer:
                 for k, v in zip(keys, vals):
                     total_metrics[k] = total_metrics.get(k, 0.0) + v.item()
             num_batches += 1
+
+            # Free batch tensors and defragment CUDA memory between eval steps
+            # (mirrors transformers Trainer.evaluation_loop behavior)
+            del batch, loss, metrics
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         avg_loss = total_loss / max(num_batches, 1)
         avg_metrics = {k: v / max(num_batches, 1) for k, v in total_metrics.items()}
