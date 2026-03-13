@@ -119,6 +119,7 @@ class GrimoireTrainer:
                 collate_fn=data_collator,
                 num_workers=config.dataloader_num_workers,
                 pin_memory=config.dataloader_pin_memory,
+                drop_last=True,
             )
 
         # Optimizer
@@ -309,6 +310,12 @@ class GrimoireTrainer:
     @torch.no_grad()
     def evaluate(self):
         """Run evaluation loop and return metrics."""
+        # Flush async CUDA errors from training before entering eval —
+        # without this, a training kernel error surfaces during eval
+        # and makes it look like eval is the problem.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}
