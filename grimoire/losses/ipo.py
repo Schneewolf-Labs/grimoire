@@ -49,6 +49,7 @@ class IPOLoss:
 
         # Reference log-probs: use cached values if available, else compute
         if "ref_chosen_logps" in batch:
+            del input_ids, attention_mask, labels  # Free concatenated tensors
             ref_chosen_logps = batch["ref_chosen_logps"].to(chosen_logps.device)
             ref_rejected_logps = batch["ref_rejected_logps"].to(chosen_logps.device)
         else:
@@ -60,8 +61,9 @@ class IPOLoss:
                         ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
                 else:
                     raise ValueError("IPOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
+                del input_ids, attention_mask  # Free concatenated tensors
                 ref_logps = self._get_batch_logps(ref_logits, labels)
-                del ref_logits
+                del ref_logits, labels
                 ref_chosen_logps = ref_logps[:len_chosen]
                 ref_rejected_logps = ref_logps[len_chosen:]
 

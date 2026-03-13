@@ -39,8 +39,9 @@ class SimPOLoss:
         input_ids, attention_mask, labels = self._concatenate(batch)
 
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        del input_ids, attention_mask  # Free concatenated tensors
         all_logps = self._get_batch_logps(logits, labels)
-        del logits
+        del logits, labels
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 

@@ -46,6 +46,7 @@ class KTOLoss:
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
         kto_label = batch["kto_label"]  # bool tensor: True=desirable, False=undesirable
+        device = input_ids.device
 
         # Policy log-probs
         logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
@@ -54,6 +55,7 @@ class KTOLoss:
 
         # Reference log-probs: use cached values if available, else compute
         if "ref_logps" in batch:
+            del input_ids, attention_mask, labels  # Free batch tensors
             ref_logps = batch["ref_logps"].to(policy_logps.device)
         else:
             with torch.no_grad():
@@ -64,8 +66,9 @@ class KTOLoss:
                         ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
                 else:
                     raise ValueError("KTOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
+                del input_ids, attention_mask  # Free batch tensors
                 ref_logps = self._get_batch_logps(ref_logits, labels)
-                del ref_logits
+                del ref_logits, labels
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps
@@ -76,7 +79,7 @@ class KTOLoss:
         undesirable_mask = ~kto_label
 
         # Compute loss
-        loss = torch.tensor(0.0, device=input_ids.device)
+        loss = torch.tensor(0.0, device=device)
         n_terms = 0
 
         if desirable_mask.any():
@@ -94,8 +97,8 @@ class KTOLoss:
 
         # Implicit rewards: beta * log(pi/pi_ref)
         rewards = self.beta * log_ratio.detach()
-        desirable_rewards = rewards[desirable_mask] if desirable_mask.any() else torch.zeros(1, device=input_ids.device)
-        undesirable_rewards = rewards[undesirable_mask] if undesirable_mask.any() else torch.zeros(1, device=input_ids.device)
+        desirable_rewards = rewards[desirable_mask] if desirable_mask.any() else torch.zeros(1, device=device)
+        undesirable_rewards = rewards[undesirable_mask] if undesirable_mask.any() else torch.zeros(1, device=device)
 
         metrics = {
             "chosen_rewards": desirable_rewards.mean().item(),
