@@ -261,11 +261,17 @@ class GrimoireTrainer:
                             self.evaluate()
                         except RuntimeError as e:
                             self._log_info(f"Eval failed at step {self.global_step}: {e}")
+                            if _is_cuda_error(e):
+                                self._log_info("CUDA context corrupted — stopping training")
+                                self._stop_requested = True
                         self.model.train()
 
                     # Checkpointing
                     if config.save_steps and self.global_step % config.save_steps == 0:
-                        self._save_checkpoint()
+                        try:
+                            self._save_checkpoint()
+                        except RuntimeError as e:
+                            self._log_info(f"Checkpoint failed at step {self.global_step}: {e}")
 
                     # Graceful stop
                     if self._stop_requested:
@@ -278,13 +284,19 @@ class GrimoireTrainer:
                 break
 
             if config.save_on_epoch_end:
-                self._save_checkpoint()
+                try:
+                    self._save_checkpoint()
+                except RuntimeError as e:
+                    self._log_info(f"End-of-epoch checkpoint failed: {e}")
 
             if self.eval_dataloader:
                 try:
                     self.evaluate()
                 except RuntimeError as e:
                     self._log_info(f"End-of-epoch eval failed: {e}")
+                    if _is_cuda_error(e):
+                        self._log_info("CUDA context corrupted — stopping training")
+                        self._stop_requested = True
 
         progress_bar.close()
         self._fire("on_train_end")
@@ -445,6 +457,12 @@ def _fmt(v):
     if abs(v) < 1e-3 and v != 0.0:
         return f"{v:.2e}"
     return f"{v:.4f}"
+
+
+def _is_cuda_error(exc):
+    """Check if a RuntimeError is a fatal CUDA error (corrupted context, unrecoverable)."""
+    msg = str(exc).lower()
+    return "cuda error" in msg or "cuda" in msg and "illegal" in msg
 
 
 def _config_to_dict(config):
