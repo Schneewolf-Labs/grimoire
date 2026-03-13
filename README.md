@@ -2,7 +2,7 @@
 
 A simple, multi-GPU LLM fine-tuning library. One training loop, pluggable loss functions.
 
-Built as the training engine behind [Merlina](https://github.com/schneewolflabs/Merlina), replacing TRL's ORPO trainer after it was marked experimental.
+Built as the training engine behind [Merlina](https://github.com/Schneewolf-Labs/Merlina), replacing TRL's ORPO trainer after it was marked experimental.
 
 ## Why
 
