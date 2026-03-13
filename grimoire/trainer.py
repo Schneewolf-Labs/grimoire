@@ -257,7 +257,10 @@ class GrimoireTrainer:
 
                     # Evaluation
                     if config.eval_steps and self.eval_dataloader and self.global_step % config.eval_steps == 0:
-                        self.evaluate()
+                        try:
+                            self.evaluate()
+                        except RuntimeError as e:
+                            self._log_info(f"Eval failed at step {self.global_step}: {e}")
                         self.model.train()
 
                     # Checkpointing
@@ -278,7 +281,10 @@ class GrimoireTrainer:
                 self._save_checkpoint()
 
             if self.eval_dataloader:
-                self.evaluate()
+                try:
+                    self.evaluate()
+                except RuntimeError as e:
+                    self._log_info(f"End-of-epoch eval failed: {e}")
 
         progress_bar.close()
         self._fire("on_train_end")
