@@ -11,7 +11,7 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
     shift_labels = labels[..., 1:]
 
     loss_mask = shift_labels != label_pad_token_id
-    safe_labels = torch.where(loss_mask, shift_labels, 0)
+    safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=shift_logits.size(-1) - 1)
 
     # gather + logsumexp avoids materializing the full [batch, seq, vocab] log_softmax tensor
     gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
