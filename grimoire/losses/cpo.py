@@ -102,7 +102,7 @@ class CPOLoss:
         shift_labels = labels[..., 1:]
 
         loss_mask = shift_labels != self.label_pad_token_id
-        safe_labels = torch.where(loss_mask, shift_labels, 0)
+        safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=shift_logits.size(-1) - 1)
 
         per_token_logps = (
             torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
