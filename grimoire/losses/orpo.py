@@ -91,24 +91,30 @@ class ORPOLoss:
     def _compute_nll_and_logps(self, logits, labels, len_chosen):
         """Compute NLL loss and per-sequence average log-probs in one pass.
 
-        Uses gather + logsumexp on the shifted logits view directly, avoiding
-        a .contiguous() copy of the full [batch, seq, vocab] tensor.  This
-        saves ~batch * seq * vocab * dtype bytes of peak VRAM compared to the
-        previous approach of calling F.cross_entropy (which needs contiguous
-        input) and get_batch_logps separately.
+        Processes each sequence individually so that gather + logsumexp always
+        operate on contiguous memory.  ``logits[:, :-1, :]`` is a non-contiguous
+        view (the sequence-dim slice keeps the original stride), but each row
+        ``logits[i, :-1, :]`` *is* contiguous.  Per-row iteration avoids both
+        the full ``.contiguous()`` copy and any CUDA-kernel edge cases with
+        strided inputs on large vocab dimensions.
         """
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
 
         loss_mask = shift_labels != self.label_pad_token_id
-        safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=shift_logits.size(-1) - 1)
+        vocab_size = shift_logits.size(-1)
+        safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-        # Per-token log probabilities via gather + logsumexp (no full log_softmax materialised)
-        per_token_logps = (
-            torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
-            - torch.logsumexp(shift_logits, dim=-1)
-        )
-        del shift_logits, safe_labels  # Free the large vocab-dim tensors
+        # Per-token log probs — row by row for contiguous CUDA kernel inputs
+        per_token_logps = torch.zeros_like(loss_mask, dtype=logits.dtype)
+        for i in range(shift_logits.size(0)):
+            row_logits = shift_logits[i]   # [S-1, V], contiguous
+            row_labels = safe_labels[i]    # [S-1]
+            per_token_logps[i] = (
+                torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
+                - torch.logsumexp(row_logits, dim=-1)
+            )
+        del shift_logits, safe_labels
 
         # NLL on chosen response tokens — flat average matching F.cross_entropy
         chosen_mask = loss_mask[:len_chosen]
