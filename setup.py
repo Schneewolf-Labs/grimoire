@@ -1,8 +1,16 @@
 from setuptools import setup, find_packages
 
+
+def get_version():
+    version = {}
+    with open("grimoire/_version.py") as f:
+        exec(f.read(), version)
+    return version["__version__"]
+
+
 setup(
     name="grimoire",
-    version="0.1.0",
+    version=get_version(),
     description="Simple, multi-GPU LLM fine-tuning library",
     python_requires=">=3.10",
     packages=find_packages(include=["grimoire*"]),
