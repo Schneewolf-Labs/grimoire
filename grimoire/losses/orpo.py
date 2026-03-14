@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import get_batch_logps, concatenate_preference
+from .utils import concatenate_preference
 
 
 class ORPOLoss:
@@ -37,15 +37,13 @@ class ORPOLoss:
         # Concatenate chosen + rejected for a single forward pass
         input_ids, attention_mask, labels = self._concatenate(batch)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         del input_ids, attention_mask  # Free concatenated tensors
-        logits = outputs.logits
 
-        # NLL loss on chosen response tokens only
-        chosen_nll = self._compute_nll(logits[:len_chosen], labels[:len_chosen])
-
-        # Log probabilities (average per sequence for length-invariance)
-        all_logps = get_batch_logps(logits, labels, self.label_pad_token_id)
+        # Single-pass NLL + log-probability computation.
+        # Avoids a .contiguous() copy of the full logits tensor that the
+        # separate _compute_nll path used to create (~batch*seq*vocab bytes).
+        chosen_nll, all_logps = self._compute_nll_and_logps(logits, labels, len_chosen)
         del logits, labels
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
@@ -90,17 +88,34 @@ class ORPOLoss:
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
         return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
 
-    def _compute_nll(self, logits, labels):
-        """Cross-entropy loss on response tokens (prompt tokens masked with -100)."""
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=self.label_pad_token_id,
-        )
+    def _compute_nll_and_logps(self, logits, labels, len_chosen):
+        """Compute NLL loss and per-sequence average log-probs in one pass.
 
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)
+        Uses gather + logsumexp on the shifted logits view directly, avoiding
+        a .contiguous() copy of the full [batch, seq, vocab] tensor.  This
+        saves ~batch * seq * vocab * dtype bytes of peak VRAM compared to the
+        previous approach of calling F.cross_entropy (which needs contiguous
+        input) and get_batch_logps separately.
+        """
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+
+        loss_mask = shift_labels != self.label_pad_token_id
+        safe_labels = torch.where(loss_mask, shift_labels, 0)
+
+        # Per-token log probabilities via gather + logsumexp (no full log_softmax materialised)
+        per_token_logps = (
+            torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
+            - torch.logsumexp(shift_logits, dim=-1)
+        )
+        del shift_logits, safe_labels  # Free the large vocab-dim tensors
+
+        # NLL on chosen response tokens — flat average matching F.cross_entropy
+        chosen_mask = loss_mask[:len_chosen]
+        chosen_nll = -(per_token_logps[:len_chosen] * chosen_mask).sum() / chosen_mask.sum().clamp(min=1)
+
+        # Average log-probability per sequence (for odds ratio)
+        avg_logps = (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
+
+        return chosen_nll, avg_logps
 
