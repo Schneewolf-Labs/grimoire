@@ -6,16 +6,27 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
 
     Shared by all loss functions that need per-sequence log probabilities
     (ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, and the reference log prob cache).
+
+    Processes each sequence individually so that gather + logsumexp always
+    operate on contiguous memory — ``logits[:, :-1, :]`` is a non-contiguous
+    view, but each row ``logits[i, :-1, :]`` is contiguous.
     """
     shift_logits = logits[..., :-1, :]
     shift_labels = labels[..., 1:]
 
     loss_mask = shift_labels != label_pad_token_id
-    safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=shift_logits.size(-1) - 1)
+    vocab_size = shift_logits.size(-1)
+    safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-    # gather + logsumexp avoids materializing the full [batch, seq, vocab] log_softmax tensor
-    gathered_logits = torch.gather(shift_logits, dim=2, index=safe_labels.unsqueeze(2)).squeeze(2)
-    per_token_logps = gathered_logits - torch.logsumexp(shift_logits, dim=-1)
+    # Per-row gather + logsumexp for contiguous CUDA kernel inputs
+    per_token_logps = torch.zeros_like(loss_mask, dtype=logits.dtype)
+    for i in range(shift_logits.size(0)):
+        row_logits = shift_logits[i]
+        row_labels = safe_labels[i]
+        per_token_logps[i] = (
+            torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
+            - torch.logsumexp(row_logits, dim=-1)
+        )
 
     return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
 
