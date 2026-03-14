@@ -9,7 +9,7 @@ def get_version():
 
 
 setup(
-    name="grimoire",
+    name="grimoire-rl",
     version=get_version(),
     description="Simple, multi-GPU LLM fine-tuning library",
     python_requires=">=3.10",

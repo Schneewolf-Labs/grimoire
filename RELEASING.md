@@ -62,7 +62,7 @@ To enable automated PyPI publishing:
 
 1. Go to [pypi.org/manage/account/publishing](https://pypi.org/manage/account/publishing/)
 2. Add a new pending publisher:
-   - **Project name**: `grimoire`
+   - **Project name**: `grimoire-rl`
    - **Owner**: `Schneewolf-Labs`
    - **Repository**: `grimoire`
    - **Workflow name**: `release.yml`
