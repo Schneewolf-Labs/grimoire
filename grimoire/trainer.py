@@ -43,6 +43,7 @@ class GrimoireTrainer:
         self.global_step = 0
         self.current_epoch = 0
         self._stop_requested = False
+        self._cuda_corrupted = False
 
         # Ensure pad token exists
         if tokenizer.pad_token is None:
@@ -279,11 +280,12 @@ class GrimoireTrainer:
                             if _is_cuda_error(e):
                                 self._log_info("CUDA context corrupted — stopping training")
                                 self._stop_requested = True
+                                self._cuda_corrupted = True
                         self.model.train()
 
-                    # Checkpointing — skip if CUDA context is already corrupted
-                    # (e.g. eval just failed with a CUDA error above)
-                    if config.save_steps and self.global_step % config.save_steps == 0 and not self._stop_requested:
+                    # Checkpointing — skip only if CUDA context is corrupted
+                    # (graceful stops via request_stop() should still save)
+                    if config.save_steps and self.global_step % config.save_steps == 0 and not self._cuda_corrupted:
                         try:
                             self._save_checkpoint()
                         except RuntimeError as e:
@@ -291,6 +293,7 @@ class GrimoireTrainer:
                             if _is_cuda_error(e):
                                 self._log_info("CUDA context corrupted — stopping training")
                                 self._stop_requested = True
+                                self._cuda_corrupted = True
 
                     # Graceful stop
                     if self._stop_requested:
@@ -316,6 +319,7 @@ class GrimoireTrainer:
                     if _is_cuda_error(e):
                         self._log_info("CUDA context corrupted — stopping training")
                         self._stop_requested = True
+                        self._cuda_corrupted = True
 
         progress_bar.close()
         self._fire("on_train_end")
