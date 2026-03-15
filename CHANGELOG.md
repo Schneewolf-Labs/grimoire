@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-03-14
+## [1.0.0] - 2026-03-15
 
 ### Added
 - `GrimoireTrainer` — single training loop with pluggable loss functions
