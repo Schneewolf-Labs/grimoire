@@ -281,12 +281,16 @@ class GrimoireTrainer:
                                 self._stop_requested = True
                         self.model.train()
 
-                    # Checkpointing
-                    if config.save_steps and self.global_step % config.save_steps == 0:
+                    # Checkpointing — skip if CUDA context is already corrupted
+                    # (e.g. eval just failed with a CUDA error above)
+                    if config.save_steps and self.global_step % config.save_steps == 0 and not self._stop_requested:
                         try:
                             self._save_checkpoint()
                         except RuntimeError as e:
                             self._log_info(f"Checkpoint failed at step {self.global_step}: {e}")
+                            if _is_cuda_error(e):
+                                self._log_info("CUDA context corrupted — stopping training")
+                                self._stop_requested = True
 
                     # Graceful stop
                     if self._stop_requested:
@@ -380,9 +384,26 @@ class GrimoireTrainer:
         return self._stop_requested
 
     def save_model(self, output_dir=None):
-        """Save the final model and tokenizer."""
+        """Save the final model and tokenizer.
+
+        Raises RuntimeError if CUDA context is corrupted (caller should handle).
+        """
         output_dir = output_dir or self.config.output_dir
         os.makedirs(output_dir, exist_ok=True)
+
+        # Flush async CUDA errors before attempting save — if the context is
+        # corrupted (e.g. illegal memory access during training), surface it
+        # here with a clear message instead of a confusing error from
+        # state_dict / save_pretrained.
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                if _is_cuda_error(e):
+                    raise RuntimeError(
+                        f"Cannot save model — CUDA context is corrupted: {e}"
+                    ) from e
+                raise
 
         self.accelerator.wait_for_everyone()
         unwrapped = self.accelerator.unwrap_model(self.model)
