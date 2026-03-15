@@ -52,6 +52,32 @@ def _per_token_logps(shift_logits, safe_labels):
     return torch.stack(rows)
 
 
+def safe_cross_entropy_nll(logits, labels, label_pad_token_id=-100):
+    """Compute NLL loss with safe label clamping.
+
+    The model's built-in F.cross_entropy uses labels as direct indices into
+    the vocab dimension.  If any label >= vocab_size (can happen with extended/
+    abliterated tokenizers), that's an out-of-bounds GPU access causing a
+    "CUDA illegal memory access" error.
+
+    This function clamps labels to [0, vocab_size-1] before computing loss,
+    matching the safety used in training paths.
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    loss_mask = shift_labels != label_pad_token_id
+    vocab_size = shift_logits.size(-1)
+    safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
+
+    flat_logits = shift_logits.view(-1, vocab_size)
+    flat_labels = safe_labels.view(-1)
+    flat_mask = loss_mask.view(-1).float()
+
+    per_token_loss = F.cross_entropy(flat_logits, flat_labels, reduction="none")
+    return (per_token_loss * flat_mask).sum() / flat_mask.sum().clamp(min=1)
+
+
 def get_batch_logps(logits, labels, label_pad_token_id=-100):
     """Average log probability per sequence over response tokens only.
 

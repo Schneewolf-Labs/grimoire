@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import _log1mexp, _per_token_logps, concatenate_preference
+from .utils import _log1mexp, _per_token_logps, concatenate_preference, safe_cross_entropy_nll
 
 
 class ORPOLoss:
@@ -76,10 +76,10 @@ class ORPOLoss:
         outputs = model(
             input_ids=batch["chosen_input_ids"],
             attention_mask=batch["chosen_attention_mask"],
-            labels=batch["chosen_labels"],
             use_cache=False,
         )
-        return outputs.loss, {}
+        loss = safe_cross_entropy_nll(outputs.logits, batch["chosen_labels"], self.label_pad_token_id)
+        return loss, {}
 
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
