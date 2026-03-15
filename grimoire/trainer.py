@@ -68,6 +68,12 @@ class GrimoireTrainer:
 
         # Gradient checkpointing (use_reentrant=False for DDP/FSDP compatibility)
         if config.gradient_checkpointing:
+            # Disable KV cache at the config level — some model architectures
+            # (e.g. Qwen) have internal decoder layers that check
+            # model.config.use_cache directly during checkpointed recomputation
+            # rather than relying on the use_cache=False forward kwarg.
+            if hasattr(model, "config"):
+                model.config.use_cache = False
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
