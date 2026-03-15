@@ -18,15 +18,17 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
     vocab_size = shift_logits.size(-1)
     safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-    # Per-row gather + logsumexp for contiguous CUDA kernel inputs
-    per_token_logps = torch.zeros_like(loss_mask, dtype=logits.dtype)
+    # Per-row gather + logsumexp for contiguous CUDA kernel inputs.
+    # List + stack preserves autograd (in-place assign to zeros_like would not).
+    rows = []
     for i in range(shift_logits.size(0)):
         row_logits = shift_logits[i]
         row_labels = safe_labels[i]
-        per_token_logps[i] = (
+        rows.append(
             torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
             - torch.logsumexp(row_logits, dim=-1)
         )
+    per_token_logps = torch.stack(rows)
 
     return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
 

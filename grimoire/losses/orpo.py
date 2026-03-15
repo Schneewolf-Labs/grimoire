@@ -105,15 +105,18 @@ class ORPOLoss:
         vocab_size = shift_logits.size(-1)
         safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-        # Per-token log probs — row by row for contiguous CUDA kernel inputs
-        per_token_logps = torch.zeros_like(loss_mask, dtype=logits.dtype)
+        # Per-token log probs — row by row for contiguous CUDA kernel inputs.
+        # Use list + stack (not pre-allocated tensor + in-place assign) so that
+        # autograd can track gradients back through gather/logsumexp to the model.
+        rows = []
         for i in range(shift_logits.size(0)):
             row_logits = shift_logits[i]   # [S-1, V], contiguous
             row_labels = safe_labels[i]    # [S-1]
-            per_token_logps[i] = (
+            rows.append(
                 torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
                 - torch.logsumexp(row_logits, dim=-1)
             )
+        per_token_logps = torch.stack(rows)
         del shift_logits, safe_labels
 
         # NLL on chosen response tokens — flat average matching F.cross_entropy

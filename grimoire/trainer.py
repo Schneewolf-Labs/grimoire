@@ -66,6 +66,16 @@ class GrimoireTrainer:
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0
 
+        # Disable KV cache at the config level — transformers.Trainer always
+        # does this (TrainingArguments.use_cache defaults to False).  Even
+        # though we pass use_cache=False as a forward kwarg, some model
+        # architectures (e.g. Qwen) have internal layers that check
+        # model.config.use_cache directly.  Without this, the model may
+        # allocate or manage KV cache tensors during training, wasting
+        # memory and potentially causing CUDA errors.
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+
         # Gradient checkpointing (use_reentrant=False for DDP/FSDP compatibility)
         if config.gradient_checkpointing:
             model.gradient_checkpointing_enable(
