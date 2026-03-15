@@ -50,6 +50,21 @@ class GrimoireTrainer:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        # Resize embeddings if tokenizer has more tokens than the model
+        # (common with abliterated/extended models).  Without this, any
+        # token ID >= vocab_size causes an out-of-bounds nn.Embedding
+        # lookup on GPU — an async CUDA error that surfaces later at the
+        # next synchronize() call (typically eval), making it look like
+        # eval is broken.  TRL does this automatically; we must too.
+        if hasattr(model, "get_input_embeddings") and hasattr(model, "resize_token_embeddings"):
+            embedding_size = model.get_input_embeddings().weight.shape[0]
+            if len(tokenizer) > embedding_size:
+                logger.warning(
+                    f"Tokenizer vocab ({len(tokenizer)}) > model embeddings ({embedding_size}). "
+                    f"Resizing embeddings to match tokenizer."
+                )
+                model.resize_token_embeddings(len(tokenizer))
+
         # Apply PEFT / LoRA
         if peft_config is not None:
             from peft import get_peft_model, prepare_model_for_kbit_training
@@ -324,12 +339,18 @@ class GrimoireTrainer:
     @torch.no_grad()
     def evaluate(self):
         """Run evaluation loop and return metrics."""
-        # Flush async CUDA errors from training before entering eval —
-        # without this, a training kernel error surfaces during eval
-        # and makes it look like eval is the problem.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+        # Disable gradient checkpointing during eval — it interacts badly
+        # with torch.no_grad() on quantized models (bitsandbytes 4-bit),
+        # causing CUDA illegal memory access.  TRL does the same thing via
+        # its disable_gradient_checkpointing context manager.
+        grad_ckpt_was_enabled = getattr(self.model, "is_gradient_checkpointing", False)
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_disable()
+
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}
@@ -366,6 +387,11 @@ class GrimoireTrainer:
         self._log_metrics(eval_results)
         self._fire("on_evaluate", metrics=eval_results)
 
+        # Restore gradient checkpointing and training mode
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         self.model.train()
         return eval_results
 

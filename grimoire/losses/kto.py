@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.kto import KTOCollator
-from .utils import get_batch_logps, safe_cross_entropy_nll
+from .utils import get_batch_logps
 
 
 class KTOLoss:
@@ -114,14 +114,8 @@ class KTOLoss:
         return loss, metrics
 
     def _eval_forward(self, model, batch):
-        """Eval uses NLL on all sequences (same as standard LM eval)."""
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            use_cache=False,
-        )
-        loss = safe_cross_entropy_nll(outputs.logits, batch["labels"], self.label_pad_token_id)
-        return loss, {}
+        """Eval uses the same forward pass as training."""
+        return self._train_forward(model, batch)
 
     def _get_batch_logps(self, logits, labels):
         """Average log probability per sequence over response tokens only."""

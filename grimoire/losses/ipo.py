@@ -1,7 +1,7 @@
 import torch
 
 from ..data.preference import PreferenceCollator
-from .utils import get_batch_logps, concatenate_preference, safe_cross_entropy_nll
+from .utils import get_batch_logps, concatenate_preference
 
 
 class IPOLoss:
@@ -88,14 +88,8 @@ class IPOLoss:
         return loss, metrics
 
     def _eval_forward(self, model, batch):
-        """Eval uses NLL on chosen sequences only (same as standard LM eval)."""
-        outputs = model(
-            input_ids=batch["chosen_input_ids"],
-            attention_mask=batch["chosen_attention_mask"],
-            use_cache=False,
-        )
-        loss = safe_cross_entropy_nll(outputs.logits, batch["chosen_labels"], self.label_pad_token_id)
-        return loss, {}
+        """Eval uses the same forward pass as training."""
+        return self._train_forward(model, batch)
 
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
