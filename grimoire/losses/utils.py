@@ -1,4 +1,55 @@
 import torch
+import torch.nn.functional as F
+
+_LN2 = -0.6931471805599453  # -ln(2)
+
+
+def _log1mexp(x):
+    """Numerically stable log(1 - exp(x)) for x <= 0.
+
+    Uses two branches to avoid catastrophic cancellation:
+    - x < -ln(2): log1p(-exp(x))   — exp(x) < 0.5, so 1-exp(x) > 0.5
+    - x >= -ln(2): log(-expm1(x))  — expm1 is accurate near 0
+
+    Matches the approach used by TRL and recommended by Machler (2012).
+    """
+    return torch.where(
+        x < _LN2,
+        torch.log1p(-torch.exp(x)),
+        torch.log(-torch.expm1(x)),
+    )
+
+
+def _per_token_logps(shift_logits, safe_labels):
+    """Compute per-token log probabilities with dtype-aware numerics.
+
+    For float32/64, uses gather + logsumexp (fast, numerically stable).
+    For bf16/fp16, falls back to F.log_softmax which internally upcasts
+    to float32 — torch.logsumexp on half-precision with large vocab dims
+    (e.g. 152k) can produce subtly wrong values that lead to NaN gradients
+    and CUDA errors downstream.  This matches TRL's selective_log_softmax.
+
+    Processes each row individually so CUDA kernels always get contiguous
+    memory (logits[:, :-1, :] is a non-contiguous view, but each row is
+    contiguous).
+    """
+    rows = []
+    if shift_logits.dtype in (torch.float32, torch.float64):
+        for i in range(shift_logits.size(0)):
+            row_logits = shift_logits[i]
+            row_labels = safe_labels[i]
+            rows.append(
+                torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
+                - torch.logsumexp(row_logits, dim=-1)
+            )
+    else:
+        # bf16 / fp16: F.log_softmax upcasts internally for stability
+        for i in range(shift_logits.size(0)):
+            row_logps = F.log_softmax(shift_logits[i], dim=-1)
+            rows.append(
+                torch.gather(row_logps, dim=1, index=safe_labels[i].unsqueeze(1)).squeeze(1)
+            )
+    return torch.stack(rows)
 
 
 def get_batch_logps(logits, labels, label_pad_token_id=-100):
@@ -6,10 +57,6 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
 
     Shared by all loss functions that need per-sequence log probabilities
     (ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, and the reference log prob cache).
-
-    Processes each sequence individually so that gather + logsumexp always
-    operate on contiguous memory — ``logits[:, :-1, :]`` is a non-contiguous
-    view, but each row ``logits[i, :-1, :]`` is contiguous.
     """
     shift_logits = logits[..., :-1, :]
     shift_labels = labels[..., 1:]
@@ -18,17 +65,7 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
     vocab_size = shift_logits.size(-1)
     safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-    # Per-row gather + logsumexp for contiguous CUDA kernel inputs.
-    # List + stack preserves autograd (in-place assign to zeros_like would not).
-    rows = []
-    for i in range(shift_logits.size(0)):
-        row_logits = shift_logits[i]
-        row_labels = safe_labels[i]
-        rows.append(
-            torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
-            - torch.logsumexp(row_logits, dim=-1)
-        )
-    per_token_logps = torch.stack(rows)
+    per_token_logps = _per_token_logps(shift_logits, safe_labels)
 
     return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
 

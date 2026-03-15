@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import concatenate_preference
+from .utils import _per_token_logps, concatenate_preference
 
 
 class CPOLoss:
@@ -93,11 +93,7 @@ class CPOLoss:
         return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
 
     def _compute_nll_and_logps(self, logits, labels, len_chosen):
-        """Compute NLL loss and per-sequence average log-probs in one pass.
-
-        Processes each sequence individually so that gather + logsumexp always
-        operate on contiguous memory (see ORPOLoss for full rationale).
-        """
+        """Compute NLL loss and per-sequence average log-probs in one pass."""
         shift_logits = logits[..., :-1, :]
         shift_labels = labels[..., 1:]
 
@@ -105,15 +101,7 @@ class CPOLoss:
         vocab_size = shift_logits.size(-1)
         safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
 
-        rows = []
-        for i in range(shift_logits.size(0)):
-            row_logits = shift_logits[i]
-            row_labels = safe_labels[i]
-            rows.append(
-                torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
-                - torch.logsumexp(row_logits, dim=-1)
-            )
-        per_token_logps = torch.stack(rows)
+        per_token_logps = _per_token_logps(shift_logits, safe_labels)
         del shift_logits, safe_labels
 
         # NLL on chosen response tokens — flat average matching F.cross_entropy
