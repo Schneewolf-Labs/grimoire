@@ -4,4 +4,4 @@ from .callbacks import TrainerCallback as TrainerCallback
 from .losses import SFTLoss as SFTLoss, ORPOLoss as ORPOLoss, DPOLoss as DPOLoss, SimPOLoss as SimPOLoss, KTOLoss as KTOLoss, CPOLoss as CPOLoss, IPOLoss as IPOLoss, GRPOLoss as GRPOLoss
 from .data import tokenize_sft as tokenize_sft, tokenize_preference as tokenize_preference, tokenize_kto as tokenize_kto, tokenize_grpo as tokenize_grpo, SFTCollator as SFTCollator, PreferenceCollator as PreferenceCollator, KTOCollator as KTOCollator, GRPOCollator as GRPOCollator, cache_reference_log_probs as cache_reference_log_probs
 
-__version__ = "0.1.0"
+from ._version import __version__ as __version__
