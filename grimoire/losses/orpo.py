@@ -72,14 +72,7 @@ class ORPOLoss:
         return total_loss, metrics
 
     def _eval_forward(self, model, batch):
-        """Eval uses the same forward pass as training.
-
-        This avoids safe_cross_entropy_nll's .contiguous() copy of the full
-        logits tensor + F.cross_entropy on the flattened result, which causes
-        CUDA illegal memory access on quantized models.  The training path
-        (concatenated forward + row-by-row log-probs) is proven safe and also
-        gives richer eval metrics (odds ratio, reward margin, etc.).
-        """
+        """Eval uses the same forward pass as training."""
         return self._train_forward(model, batch)
 
     def _concatenate(self, batch):

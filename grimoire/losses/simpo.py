@@ -69,7 +69,3 @@ class SimPOLoss:
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
         return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
-
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)

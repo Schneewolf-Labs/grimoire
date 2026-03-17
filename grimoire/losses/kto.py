@@ -116,7 +116,3 @@ class KTOLoss:
     def _eval_forward(self, model, batch):
         """Eval uses the same forward pass as training."""
         return self._train_forward(model, batch)
-
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)

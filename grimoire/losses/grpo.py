@@ -161,7 +161,3 @@ class GRPOLoss:
         """Eval not meaningful for GRPO (no labels). Return zero loss."""
         loss = torch.tensor(0.0, device=batch["input_ids"].device)
         return loss, {}
-
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)

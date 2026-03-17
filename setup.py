@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="grimoire",
-    version="0.1.0",
+    version="1.0.0",
     description="Simple, multi-GPU LLM fine-tuning library",
     python_requires=">=3.10",
     packages=find_packages(include=["grimoire*"]),
