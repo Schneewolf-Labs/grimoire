@@ -70,12 +70,13 @@ class GrimoireTrainer:
             from peft import get_peft_model, prepare_model_for_kbit_training
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-                # Disable peft's automatic gradient checkpointing — it uses
-                # use_reentrant=True which crashes flash attention backward.
-                # We handle gradient checkpointing ourselves below with
-                # use_reentrant=False.
+                # peft's default enables gradient checkpointing with
+                # use_reentrant=True, which crashes flash attention backward.
+                # Pass use_reentrant=False explicitly to fix this.
                 model = prepare_model_for_kbit_training(
-                    model, use_gradient_checkpointing=False
+                    model,
+                    use_gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
             model = get_peft_model(model, peft_config)
             if hasattr(model, "print_trainable_parameters"):
