@@ -50,12 +50,34 @@ class GrimoireTrainer:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        # Resize embeddings if tokenizer has more tokens than the model
+        # (common with abliterated/extended models).  Without this, any
+        # token ID >= vocab_size causes an out-of-bounds nn.Embedding
+        # lookup on GPU — an async CUDA error that surfaces later at the
+        # next synchronize() call (typically eval), making it look like
+        # eval is broken.  TRL does this automatically; we must too.
+        if hasattr(model, "get_input_embeddings") and hasattr(model, "resize_token_embeddings"):
+            embedding_size = model.get_input_embeddings().weight.shape[0]
+            if len(tokenizer) > embedding_size:
+                logger.warning(
+                    f"Tokenizer vocab ({len(tokenizer)}) > model embeddings ({embedding_size}). "
+                    f"Resizing embeddings to match tokenizer."
+                )
+                model.resize_token_embeddings(len(tokenizer))
+
         # Apply PEFT / LoRA
         if peft_config is not None:
             from peft import get_peft_model, prepare_model_for_kbit_training
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-                model = prepare_model_for_kbit_training(model)
+                # peft's default enables gradient checkpointing with
+                # use_reentrant=True, which crashes flash attention backward.
+                # Pass use_reentrant=False explicitly to fix this.
+                model = prepare_model_for_kbit_training(
+                    model,
+                    use_gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
             model = get_peft_model(model, peft_config)
             if hasattr(model, "print_trainable_parameters"):
                 model.print_trainable_parameters()
@@ -65,6 +87,16 @@ class GrimoireTrainer:
             for module in model.modules():
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0
+
+        # Disable KV cache at the config level — transformers.Trainer always
+        # does this (TrainingArguments.use_cache defaults to False).  Even
+        # though we pass use_cache=False as a forward kwarg, some model
+        # architectures (e.g. Qwen) have internal layers that check
+        # model.config.use_cache directly.  Without this, the model may
+        # allocate or manage KV cache tensors during training, wasting
+        # memory and potentially causing CUDA errors.
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
         # Gradient checkpointing (use_reentrant=False for DDP/FSDP compatibility)
         if config.gradient_checkpointing:
@@ -314,12 +346,18 @@ class GrimoireTrainer:
     @torch.no_grad()
     def evaluate(self):
         """Run evaluation loop and return metrics."""
-        # Flush async CUDA errors from training before entering eval —
-        # without this, a training kernel error surfaces during eval
-        # and makes it look like eval is the problem.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+        # Disable gradient checkpointing during eval — it interacts badly
+        # with torch.no_grad() on quantized models (bitsandbytes 4-bit),
+        # causing CUDA illegal memory access.  TRL does the same thing via
+        # its disable_gradient_checkpointing context manager.
+        grad_ckpt_was_enabled = getattr(self.model, "is_gradient_checkpointing", False)
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_disable()
+
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}
@@ -356,6 +394,11 @@ class GrimoireTrainer:
         self._log_metrics(eval_results)
         self._fire("on_evaluate", metrics=eval_results)
 
+        # Restore gradient checkpointing and training mode
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
         self.model.train()
         return eval_results
 

@@ -63,19 +63,9 @@ class SimPOLoss:
         return loss, metrics
 
     def _eval_forward(self, model, batch):
-        """Eval uses NLL on chosen sequences only (same as standard LM eval)."""
-        outputs = model(
-            input_ids=batch["chosen_input_ids"],
-            attention_mask=batch["chosen_attention_mask"],
-            labels=batch["chosen_labels"],
-            use_cache=False,
-        )
-        return outputs.loss, {}
+        """Eval uses the same forward pass as training."""
+        return self._train_forward(model, batch)
 
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
         return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
-
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)

@@ -114,15 +114,5 @@ class KTOLoss:
         return loss, metrics
 
     def _eval_forward(self, model, batch):
-        """Eval uses NLL on all sequences (same as standard LM eval)."""
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
-            use_cache=False,
-        )
-        return outputs.loss, {}
-
-    def _get_batch_logps(self, logits, labels):
-        """Average log probability per sequence over response tokens only."""
-        return get_batch_logps(logits, labels, self.label_pad_token_id)
+        """Eval uses the same forward pass as training."""
+        return self._train_forward(model, batch)

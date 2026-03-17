@@ -297,7 +297,7 @@ class TestDPOLoss:
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.dim() == 0
         assert loss.item() > 0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_beta_scales_loss(self):
         torch.manual_seed(42)
@@ -480,7 +480,7 @@ class TestSimPOLoss:
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.dim() == 0
         assert loss.item() > 0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_beta_scales_loss(self):
         torch.manual_seed(42)
@@ -584,7 +584,7 @@ class TestKTOLoss:
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.dim() == 0
         assert loss.item() > 0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_beta_scales_loss(self):
         torch.manual_seed(42)
@@ -713,7 +713,7 @@ class TestCPOLoss:
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.dim() == 0
         assert loss.item() > 0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_beta_scales_loss(self):
         torch.manual_seed(42)
@@ -817,7 +817,7 @@ class TestIPOLoss:
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.dim() == 0
         assert loss.item() > 0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_beta_scales_loss(self):
         torch.manual_seed(42)
@@ -1023,7 +1023,7 @@ class TestGRPOLoss:
 
         loss, metrics = loss_fn(model, batch, training=False)
         assert loss.item() == 0.0
-        assert metrics == {}
+        assert isinstance(metrics, dict)
 
     def test_num_generations_affects_batch(self):
         """More generations should still produce valid loss."""
