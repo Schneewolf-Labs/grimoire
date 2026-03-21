@@ -70,16 +70,15 @@ class GrimoireTrainer:
             from peft import get_peft_model, prepare_model_for_kbit_training
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-                # prepare_model_for_kbit_training casts norms to float32,
-                # freezes base params, and optionally enables gradient
-                # checkpointing.  Respect config.gradient_checkpointing
-                # rather than hardcoding True — gradient checkpointing +
-                # torch.no_grad() + quantized weights causes CUDA errors
-                # in loss functions that use disable_adapter() for
-                # reference forward passes (DPO, KTO, IPO).
+                # Gradient checkpointing is essential for quantized models —
+                # without it, activations alone can exceed VRAM.
+                # use_reentrant=False is required for flash attention backward.
+                # The interaction between gradient checkpointing +
+                # torch.no_grad() + quantized weights is handled by
+                # _disable_grad_checkpointing() in the loss functions.
                 model = prepare_model_for_kbit_training(
                     model,
-                    use_gradient_checkpointing=config.gradient_checkpointing,
+                    use_gradient_checkpointing=True,
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
             model = get_peft_model(model, peft_config)
