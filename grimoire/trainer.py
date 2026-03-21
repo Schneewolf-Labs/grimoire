@@ -70,15 +70,13 @@ class GrimoireTrainer:
             from peft import get_peft_model, prepare_model_for_kbit_training
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-                # Gradient checkpointing is essential for quantized models —
-                # without it, activations alone can exceed VRAM.
                 # use_reentrant=False is required for flash attention backward.
                 # The interaction between gradient checkpointing +
                 # torch.no_grad() + quantized weights is handled by
                 # _disable_grad_checkpointing() in the loss functions.
                 model = prepare_model_for_kbit_training(
                     model,
-                    use_gradient_checkpointing=True,
+                    use_gradient_checkpointing=config.gradient_checkpointing,
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
             model = get_peft_model(model, peft_config)
