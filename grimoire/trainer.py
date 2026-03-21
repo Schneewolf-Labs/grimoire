@@ -203,6 +203,12 @@ class GrimoireTrainer:
     def train(self):
         config = self.config
 
+        # Pre-flight: validate that token IDs are within embedding bounds.
+        # Out-of-bounds IDs cause async CUDA errors that surface later at
+        # unrelated operations (flash-attn, cuBLAS, etc.), making them
+        # extremely hard to diagnose.
+        self._validate_token_ids()
+
         self._log_info("***** Starting training *****")
         self._log_info(f"  Num examples = {len(self.train_dataloader.dataset)}")
         self._log_info(f"  Num epochs = {config.num_epochs}")
@@ -433,6 +439,41 @@ class GrimoireTrainer:
             self._log_info(f"Model saved to {output_dir}")
 
     # ---- Internal helpers ----
+
+    def _validate_token_ids(self):
+        """Check that dataset token IDs fit within the model's embedding table.
+
+        An out-of-bounds embedding lookup silently corrupts CUDA memory and
+        surfaces later as an unrelated illegal-memory-access error in flash
+        attention, cuBLAS, or other kernels — extremely hard to diagnose.
+        """
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if not hasattr(unwrapped, "get_input_embeddings"):
+            return
+        emb = unwrapped.get_input_embeddings()
+        if emb is None:
+            return
+        vocab_size = emb.weight.shape[0]
+
+        # Scan a handful of batches from the training set (on CPU, no GPU cost)
+        n_checked = 0
+        for batch in self.train_dataloader:
+            # Find all tensor fields that look like token IDs
+            for key in ("input_ids", "chosen_input_ids", "rejected_input_ids"):
+                ids = batch.get(key)
+                if ids is None:
+                    continue
+                max_id = ids.max().item()
+                if max_id >= vocab_size:
+                    raise ValueError(
+                        f"Token ID {max_id} in '{key}' exceeds model "
+                        f"embedding table size ({vocab_size}). The dataset "
+                        f"was likely tokenized with a different tokenizer or "
+                        f"the model's vocabulary is smaller than expected."
+                    )
+            n_checked += 1
+            if n_checked >= 3:
+                break
 
     def _create_optimizer(self, model):
         no_decay = ["bias", "layer_norm.weight", "LayerNorm.weight"]
