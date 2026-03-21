@@ -1,7 +1,29 @@
+from contextlib import contextmanager
+
 import torch
 import torch.nn.functional as F
 
 _LN2 = -0.6931471805599453  # -ln(2)
+
+
+@contextmanager
+def _disable_grad_checkpointing(model):
+    """Temporarily disable gradient checkpointing for a reference forward pass.
+
+    Gradient checkpointing + torch.no_grad() + quantized models (bitsandbytes
+    4-bit/8-bit) causes CUDA illegal memory access.  This mirrors the
+    workaround in GrimoireTrainer.evaluate().
+    """
+    was_enabled = getattr(model, "is_gradient_checkpointing", False)
+    if was_enabled:
+        model.gradient_checkpointing_disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
 
 def _log1mexp(x):

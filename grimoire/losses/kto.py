@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..data.kto import KTOCollator
-from .utils import get_batch_logps
+from .utils import get_batch_logps, _disable_grad_checkpointing
 
 
 class KTOLoss:
@@ -63,7 +63,7 @@ class KTOLoss:
                 if self.ref_model is not None:
                     ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
                 elif hasattr(model, "disable_adapter"):
-                    with model.disable_adapter():
+                    with _disable_grad_checkpointing(model), model.disable_adapter():
                         ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
                 else:
                     raise ValueError("KTOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
