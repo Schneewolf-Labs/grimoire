@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from grimoire.losses.sft import SFTLoss
 from grimoire.losses.orpo import ORPOLoss
-from grimoire.losses.utils import pad_dim1 as _pad_dim1
+from grimoire.losses.utils import pad_dim1 as _pad_dim1, _disable_grad_checkpointing
 from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
@@ -1271,3 +1271,74 @@ class TestKTOCachedLogProbs:
 
         with pytest.raises(ValueError, match="requires either"):
             loss_fn(model, batch, training=True)
+
+
+class TestDisableGradCheckpointing:
+    def test_disables_and_restores(self):
+        """Context manager should disable grad checkpointing and restore it."""
+
+        class FakeModel:
+            is_gradient_checkpointing = True
+            _disabled = False
+
+            def gradient_checkpointing_disable(self):
+                self.is_gradient_checkpointing = False
+                self._disabled = True
+
+            def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+                self.is_gradient_checkpointing = True
+
+        model = FakeModel()
+        assert model.is_gradient_checkpointing
+
+        with _disable_grad_checkpointing(model):
+            assert not model.is_gradient_checkpointing
+            assert model._disabled
+
+        assert model.is_gradient_checkpointing
+
+    def test_no_op_when_not_enabled(self):
+        """Should be a no-op when gradient checkpointing is not enabled."""
+
+        class FakeModel:
+            is_gradient_checkpointing = False
+            _disabled = False
+
+            def gradient_checkpointing_disable(self):
+                self._disabled = True
+
+            def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+                pass
+
+        model = FakeModel()
+        with _disable_grad_checkpointing(model):
+            assert not model._disabled  # should not have been called
+
+    def test_restores_on_exception(self):
+        """Gradient checkpointing should be restored even if body raises."""
+
+        class FakeModel:
+            is_gradient_checkpointing = True
+
+            def gradient_checkpointing_disable(self):
+                self.is_gradient_checkpointing = False
+
+            def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+                self.is_gradient_checkpointing = True
+
+        model = FakeModel()
+        with pytest.raises(RuntimeError):
+            with _disable_grad_checkpointing(model):
+                raise RuntimeError("boom")
+
+        assert model.is_gradient_checkpointing
+
+    def test_no_op_without_attribute(self):
+        """Should handle models without is_gradient_checkpointing."""
+
+        class BareModel:
+            pass
+
+        model = BareModel()
+        with _disable_grad_checkpointing(model):
+            pass  # should not raise

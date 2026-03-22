@@ -1,8 +1,10 @@
 """End-to-end smoke test for GrimoireTrainer."""
 
+import copy
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -12,6 +14,11 @@ from datasets import Dataset
 from grimoire import GrimoireTrainer, TrainingConfig, TrainerCallback
 from grimoire.losses.sft import SFTLoss
 from grimoire.losses.orpo import ORPOLoss
+from grimoire.losses.dpo import DPOLoss
+from grimoire.losses.simpo import SimPOLoss
+from grimoire.losses.kto import KTOLoss
+from grimoire.losses.cpo import CPOLoss
+from grimoire.losses.ipo import IPOLoss
 
 
 class TinyLM(nn.Module):
@@ -45,6 +52,9 @@ class TinyLM(nn.Module):
             )
 
         return type("Output", (), {"logits": logits, "loss": loss})()
+
+    def get_input_embeddings(self):
+        return self.embed
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         pass  # no-op for tiny model
@@ -763,5 +773,570 @@ class TestCheckpointing:
             checkpoints = [d for d in os.listdir(tmpdir) if d.startswith("checkpoint-")]
             assert len(checkpoints) <= 2, f"Expected <= 2 checkpoints, got {len(checkpoints)}: {checkpoints}"
             assert len(checkpoints) > 0
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def make_kto_dataset(n=32, seq_len=16, vocab_size=64):
+    """Create a small KTO dataset."""
+    data = {
+        "input_ids": [torch.randint(2, vocab_size, (seq_len,)).tolist() for _ in range(n)],
+        "attention_mask": [[1] * seq_len for _ in range(n)],
+        "labels": [
+            [-100] * 4 + torch.randint(2, vocab_size, (seq_len - 4,)).tolist()
+            for _ in range(n)
+        ],
+        "kto_label": [i % 2 == 0 for i in range(n)],
+    }
+    return Dataset.from_dict(data)
+
+
+class PeftTinyLM(TinyLM):
+    """TinyLM with PEFT-like adapter support for testing disable_adapter path."""
+
+    def __init__(self, vocab_size=64, hidden_size=32, num_layers=1):
+        super().__init__(vocab_size, hidden_size, num_layers)
+        self.adapter = nn.Linear(hidden_size, hidden_size)
+        self._adapter_enabled = True
+
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
+        h = self.embed(input_ids)
+        if self._adapter_enabled:
+            h = h + self.adapter(h)
+        for layer in self.layers:
+            h = torch.relu(layer(h))
+        logits = self.head(h)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, self.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return type("Output", (), {"logits": logits, "loss": loss})()
+
+    @contextmanager
+    def disable_adapter(self):
+        self._adapter_enabled = False
+        try:
+            yield
+        finally:
+            self._adapter_enabled = True
+
+
+def _device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class TestKTOTraining:
+    def test_kto_trains_with_ref_model(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            ref_model = copy.deepcopy(model).to(_device())
+            ref_model.eval()
+            dataset = make_kto_dataset(n=32)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                gradient_accumulation_steps=1,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=KTOLoss(ref_model=ref_model, beta=0.1),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_kto_trains_with_disable_adapter(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = PeftTinyLM()
+            dataset = make_kto_dataset(n=16)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=KTOLoss(ref_model=None, beta=0.1),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_kto_metrics_present(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            ref_model = copy.deepcopy(model).to(_device())
+            ref_model.eval()
+            dataset = make_kto_dataset(n=16)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                save_on_epoch_end=False,
+            )
+
+            all_metrics = []
+
+            class MetricsTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    all_metrics.append(metrics)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=KTOLoss(ref_model=ref_model, beta=0.1),
+                train_dataset=dataset,
+                callbacks=[MetricsTracker()],
+            )
+            trainer.train()
+
+            assert len(all_metrics) > 0
+            m = all_metrics[0]
+            assert "chosen_rewards" in m
+            assert "rejected_rewards" in m
+            assert "kl_ref" in m
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_kto_eval(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            ref_model = copy.deepcopy(model).to(_device())
+            ref_model.eval()
+            train_ds = make_kto_dataset(n=16)
+            eval_ds = make_kto_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                eval_steps=2,
+                save_on_epoch_end=False,
+            )
+
+            eval_results = []
+
+            class EvalTracker(TrainerCallback):
+                def on_evaluate(self, trainer, metrics):
+                    eval_results.append(metrics)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=KTOLoss(ref_model=ref_model, beta=0.1),
+                train_dataset=train_ds,
+                eval_dataset=eval_ds,
+                callbacks=[EvalTracker()],
+            )
+            trainer.train()
+
+            assert len(eval_results) > 0
+            assert "eval/loss" in eval_results[0]
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestDPOTraining:
+    def test_dpo_trains_with_ref_model(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            ref_model = copy.deepcopy(model).to(_device())
+            ref_model.eval()
+            dataset = make_preference_dataset(n=32)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                gradient_accumulation_steps=1,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                disable_dropout=True,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=DPOLoss(ref_model=ref_model, beta=0.1),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_dpo_trains_with_disable_adapter(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = PeftTinyLM()
+            dataset = make_preference_dataset(n=16)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=DPOLoss(ref_model=None, beta=0.1),
+                train_dataset=dataset,
+            )
+            trainer.train()  # should not raise
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestSimPOTraining:
+    def test_simpo_trains(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            dataset = make_preference_dataset(n=32)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                disable_dropout=True,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SimPOLoss(beta=2.0, gamma=0.5),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestCPOTraining:
+    def test_cpo_trains(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            dataset = make_preference_dataset(n=32)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                disable_dropout=True,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=CPOLoss(beta=0.1),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestIPOTraining:
+    def test_ipo_trains_with_ref_model(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            ref_model = copy.deepcopy(model).to(_device())
+            ref_model.eval()
+            dataset = make_preference_dataset(n=32)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                disable_dropout=True,
+                save_on_epoch_end=False,
+            )
+
+            losses = []
+
+            class LossTracker(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    losses.append(loss)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=IPOLoss(ref_model=ref_model, beta=0.1),
+                train_dataset=dataset,
+                callbacks=[LossTracker()],
+            )
+            trainer.train()
+
+            assert len(losses) > 0
+            assert all(not torch.tensor(v).isnan() for v in losses)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_ipo_trains_with_disable_adapter(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = PeftTinyLM()
+            dataset = make_preference_dataset(n=16)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=IPOLoss(ref_model=None, beta=0.1),
+                train_dataset=dataset,
+            )
+            trainer.train()  # should not raise
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestTokenIdValidation:
+    def test_oob_token_ids_raises(self):
+        """Dataset with token IDs exceeding embedding size should raise ValueError."""
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM(vocab_size=64)
+            # Create dataset with token IDs >= vocab_size
+            data = {
+                "input_ids": [[100, 200, 300]] * 8,  # All exceed vocab_size=64
+                "attention_mask": [[1, 1, 1]] * 8,
+                "labels": [[-100, 200, 300]] * 8,
+            }
+            dataset = Dataset.from_dict(data)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+
+            with pytest.raises(ValueError, match="exceeds model embedding table size"):
+                trainer.train()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_valid_token_ids_passes(self):
+        """Dataset with valid token IDs should train without issue."""
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM(vocab_size=64)
+            dataset = make_sft_dataset(n=8, vocab_size=64)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+            trainer.train()  # should not raise
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_oob_preference_token_ids_raises(self):
+        """Preference dataset with OOB token IDs should raise ValueError."""
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM(vocab_size=64)
+            data = {
+                "chosen_input_ids": [[100, 200, 300]] * 8,
+                "chosen_attention_mask": [[1, 1, 1]] * 8,
+                "chosen_labels": [[-100, 200, 300]] * 8,
+                "rejected_input_ids": [[1, 2, 3]] * 8,
+                "rejected_attention_mask": [[1, 1, 1]] * 8,
+                "rejected_labels": [[-100, 2, 3]] * 8,
+            }
+            dataset = Dataset.from_dict(data)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=ORPOLoss(beta=0.1),
+                train_dataset=dataset,
+            )
+
+            with pytest.raises(ValueError, match="exceeds model embedding table size"):
+                trainer.train()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

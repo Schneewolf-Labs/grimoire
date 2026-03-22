@@ -452,25 +452,24 @@ class GrimoireTrainer:
             return
         vocab_size = emb.weight.shape[0]
 
-        # Scan a handful of batches from the training set (on CPU, no GPU cost)
-        n_checked = 0
-        for batch in self.train_dataloader:
-            # Find all tensor fields that look like token IDs
+        # Scan a few raw examples from the dataset (CPU-only, no GPU cost,
+        # doesn't consume dataloader batches).
+        dataset = self.train_dataloader.dataset
+        n_to_check = min(len(dataset), 50)
+        for i in range(n_to_check):
+            example = dataset[i]
             for key in ("input_ids", "chosen_input_ids", "rejected_input_ids"):
-                ids = batch.get(key)
+                ids = example.get(key)
                 if ids is None:
                     continue
-                max_id = ids.max().item()
+                max_id = max(ids) if isinstance(ids, list) else ids.max().item()
                 if max_id >= vocab_size:
                     raise ValueError(
-                        f"Token ID {max_id} in '{key}' exceeds model "
-                        f"embedding table size ({vocab_size}). The dataset "
+                        f"Token ID {max_id} in '{key}' (example {i}) exceeds "
+                        f"model embedding table size ({vocab_size}). The dataset "
                         f"was likely tokenized with a different tokenizer or "
                         f"the model's vocabulary is smaller than expected."
                     )
-            n_checked += 1
-            if n_checked >= 3:
-                break
 
     def _create_optimizer(self, model):
         no_decay = ["bias", "layer_norm.weight", "LayerNorm.weight"]
