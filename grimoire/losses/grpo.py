@@ -1,7 +1,7 @@
 import torch
 
 from ..data.grpo import GRPOCollator
-from .utils import get_batch_logps
+from .utils import get_batch_logps, _disable_grad_checkpointing
 
 
 class GRPOLoss:
@@ -63,7 +63,7 @@ class GRPOLoss:
         repeated_ids = input_ids.repeat_interleave(G, dim=0)  # [B*G, prompt_len]
         repeated_mask = attention_mask.repeat_interleave(G, dim=0)  # [B*G, prompt_len]
 
-        with torch.no_grad():
+        with _disable_grad_checkpointing(model), torch.no_grad():
             model.eval()
             generated = model.generate(
                 input_ids=repeated_ids,
@@ -111,7 +111,7 @@ class GRPOLoss:
         completion_length = gen_labels.size(1) - prompt_len
 
         # 4. Old log-probs (from generation policy, no grad)
-        with torch.no_grad():
+        with _disable_grad_checkpointing(model), torch.no_grad():
             old_logits = model(
                 input_ids=generated,
                 attention_mask=gen_attention_mask,

@@ -9,7 +9,7 @@ the forward passes per step for DPO, KTO, and IPO.
 import torch
 from torch.utils.data import DataLoader
 
-from ..losses.utils import get_batch_logps as _get_batch_logps
+from ..losses.utils import get_batch_logps as _get_batch_logps, _disable_grad_checkpointing
 
 
 def cache_reference_log_probs(
@@ -82,7 +82,7 @@ def cache_reference_log_probs(
     else:
         all_logps = []
 
-    with torch.no_grad():
+    with _disable_grad_checkpointing(ref_model), torch.no_grad():
         for batch in loader:
             if is_preference:
                 chosen_logps = _forward_logps(
