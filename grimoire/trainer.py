@@ -1,3 +1,4 @@
+import gc
 import os
 import math
 import glob
@@ -407,6 +408,16 @@ class GrimoireTrainer:
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
         self.model.train()
+
+        # Defragment CUDA memory before returning to training.
+        # Eval forward passes create allocations of varying sizes that
+        # fragment the memory pool.  Without this, the next training
+        # backward pass may fail to find a contiguous block (OOM despite
+        # having enough total free memory).
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+
         return eval_results
 
     def request_stop(self):
