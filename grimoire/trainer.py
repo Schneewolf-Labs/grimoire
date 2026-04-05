@@ -14,6 +14,114 @@ from transformers import get_scheduler
 
 from .config import TrainingConfig
 
+
+def _newton_schulz_5(G, steps=5):
+    """Compute the matrix sign function via 5 Newton-Schulz iterations.
+
+    Approximates G @ (G^T G)^{-1/2} which orthogonalizes the matrix.
+    Uses quintic iteration coefficients from Bernstein & Bonev (2024).
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G / (G.norm() + 1e-7)
+    if G.size(-2) > G.size(-1):
+        X = X.transpose(-1, -2)
+    for _ in range(steps):
+        A = X @ X.transpose(-1, -2)
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.transpose(-1, -2)
+    return X
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer — Momentum + Orthogonalization.
+
+    Applies Newton-Schulz orthogonalization to the momentum buffer for 2D+
+    parameters (linear layers). Non-matrix parameters (embeddings, biases,
+    norms) should be handled by a separate AdamW optimizer passed via
+    ``adam_optimizer``.
+
+    Based on: https://github.com/KellerJordan/Muon
+
+    Args:
+        params: Parameters for Muon (should be 2D+ tensors only).
+        lr: Learning rate for Muon params (default: 0.02).
+        momentum: Momentum coefficient (default: 0.95).
+        nesterov: Use Nesterov momentum (default: True).
+        ns_steps: Newton-Schulz iteration count (default: 5).
+        adam_optimizer: AdamW optimizer for non-matrix params (optional).
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 ns_steps=5, adam_optimizer=None):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        ns_steps=ns_steps)
+        super().__init__(params, defaults)
+        self.adam_optimizer = adam_optimizer
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["momentum_buffer"] = torch.zeros_like(g)
+
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+
+                # Orthogonalize via Newton-Schulz for 2D+ params
+                orig_shape = g.shape
+                if g.ndim > 2:
+                    g = g.view(g.size(0), -1)
+                g = _newton_schulz_5(g, steps=ns_steps)
+                g = g.view(orig_shape)
+
+                # Scale update by max(1, sqrt(fan_in / fan_out))
+                # This normalizes the update magnitude across layers
+                if g.ndim >= 2:
+                    fan_in = g.shape[1] * (g[0].numel() // g.shape[1] if g.ndim > 2 else 1)
+                    fan_out = g.shape[0]
+                    scale = max(1, (fan_in / fan_out) ** 0.5)
+                    p.add_(g, alpha=-lr * scale)
+                else:
+                    p.add_(g, alpha=-lr)
+
+                state["step"] += 1
+
+        # Step the inner AdamW for non-matrix params
+        if self.adam_optimizer is not None:
+            self.adam_optimizer.step()
+
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        if self.adam_optimizer is not None:
+            self.adam_optimizer.zero_grad(set_to_none=set_to_none)
+
 logger = logging.getLogger(__name__)
 
 
@@ -522,10 +630,53 @@ class GrimoireTrainer:
         elif opt == "adafactor":
             from transformers.optimization import Adafactor
             return Adafactor(param_groups, lr=lr, relative_step=False, scale_parameter=False)
+        elif opt == "muon":
+            return self._create_muon_optimizer(model, lr)
         elif opt == "sgd":
             return torch.optim.SGD(param_groups, lr=lr, momentum=0.9)
         else:
             raise ValueError(f"Unknown optimizer: {opt}")
+
+    def _create_muon_optimizer(self, model, lr):
+        """Create a Muon optimizer with AdamW for non-matrix params.
+
+        Muon applies Newton-Schulz orthogonalization to momentum updates for
+        2D+ parameters (linear layers), while using AdamW for 1D parameters
+        (embeddings, biases, layer norms). The embedding/head params use a
+        lower learning rate (0.1x) since they benefit from more conservative
+        updates.
+        """
+        muon_params = []
+        adam_decay_params = []
+        adam_no_decay_params = []
+
+        no_decay = ["bias", "layer_norm.weight", "LayerNorm.weight"]
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Muon works on 2D+ params (linear layers) that aren't embeddings
+            if param.ndim >= 2 and "embed" not in name and "lm_head" not in name:
+                muon_params.append(param)
+            elif any(nd in name for nd in no_decay):
+                adam_no_decay_params.append(param)
+            else:
+                adam_decay_params.append(param)
+
+        adam_lr = lr * 0.1
+        kwargs = {}
+        if torch.cuda.is_available():
+            kwargs["fused"] = True
+        adam_optimizer = torch.optim.AdamW(
+            [
+                {"params": adam_decay_params, "weight_decay": self.config.weight_decay},
+                {"params": adam_no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=adam_lr,
+            **kwargs,
+        )
+
+        return Muon(muon_params, lr=lr, momentum=0.95, adam_optimizer=adam_optimizer)
 
     def _save_checkpoint(self):
         checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{self.global_step}")
