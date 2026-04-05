@@ -642,6 +642,38 @@ class TestOptimizerSGD:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestMuonOptimizer:
+    def test_muon_optimizer_trains(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                optimizer="muon",
+                learning_rate=0.02,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+            trainer.train()  # should not raise
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestGradientAccumulation:
     def test_gradient_accumulation_runs(self):
         torch.manual_seed(42)

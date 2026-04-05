@@ -23,7 +23,7 @@ class TrainingConfig:
     # Precision and optimization
     mixed_precision: str = "bf16"  # "no", "fp16", "bf16"
     gradient_checkpointing: bool = True
-    optimizer: str = "adamw"  # "adamw", "adamw_8bit", "sgd"
+    optimizer: str = "adamw"  # "adamw", "adamw_8bit", "muon", "sgd"
     lr_scheduler: str = "cosine"  # "linear", "cosine", "constant", "constant_with_warmup"
     disable_dropout: bool = False
 
