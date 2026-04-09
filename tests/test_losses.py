@@ -15,6 +15,7 @@ from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
 from grimoire.losses.grpo import GRPOLoss
+from grimoire.losses.reward import RewardModelLoss
 from grimoire.data.cache import cache_reference_log_probs
 
 
@@ -1342,3 +1343,109 @@ class TestDisableGradCheckpointing:
         model = BareModel()
         with _disable_grad_checkpointing(model):
             pass  # should not raise
+
+
+class SimpleRewardModel(nn.Module):
+    """Tiny reward model that outputs a scalar per sequence."""
+
+    def __init__(self, vocab_size=32, hidden_size=16):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.head = nn.Linear(hidden_size, 1)
+        self.config = type("Config", (), {"is_encoder_decoder": False})()
+
+    def forward(self, input_ids, attention_mask=None, use_cache=False):
+        h = self.embed(input_ids)
+        if attention_mask is not None:
+            h = (h * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True).clamp(min=1)
+        else:
+            h = h.mean(dim=1)
+        logits = self.head(h)
+        return type("Output", (), {"logits": logits})()
+
+
+class TestRewardModelLoss:
+    def test_returns_scalar_loss_and_metrics(self):
+        model = SimpleRewardModel()
+        loss_fn = RewardModelLoss()
+
+        batch = {
+            "chosen_input_ids": torch.randint(0, 32, (2, 8)),
+            "chosen_attention_mask": torch.ones(2, 8, dtype=torch.long),
+            "chosen_labels": torch.randint(0, 32, (2, 8)),
+            "rejected_input_ids": torch.randint(0, 32, (2, 8)),
+            "rejected_attention_mask": torch.ones(2, 8, dtype=torch.long),
+            "rejected_labels": torch.randint(0, 32, (2, 8)),
+        }
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert loss.dim() == 0
+        assert loss.item() > 0
+        assert "accuracy" in metrics
+        assert "reward_margin" in metrics
+        assert "chosen_reward" in metrics
+        assert "rejected_reward" in metrics
+
+    def test_loss_has_gradients(self):
+        model = SimpleRewardModel()
+        loss_fn = RewardModelLoss()
+
+        batch = {
+            "chosen_input_ids": torch.randint(0, 32, (2, 8)),
+            "chosen_attention_mask": torch.ones(2, 8, dtype=torch.long),
+            "chosen_labels": torch.randint(0, 32, (2, 8)),
+            "rejected_input_ids": torch.randint(0, 32, (2, 8)),
+            "rejected_attention_mask": torch.ones(2, 8, dtype=torch.long),
+            "rejected_labels": torch.randint(0, 32, (2, 8)),
+        }
+
+        loss, _ = loss_fn(model, batch, training=True)
+        loss.backward()
+
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+        assert has_grad
+
+    def test_margin_increases_loss(self):
+        torch.manual_seed(42)
+        model = SimpleRewardModel()
+        loss_fn_no_margin = RewardModelLoss(margin=0.0)
+        loss_fn_margin = RewardModelLoss(margin=1.0)
+
+        batch = {
+            "chosen_input_ids": torch.randint(0, 32, (4, 8)),
+            "chosen_attention_mask": torch.ones(4, 8, dtype=torch.long),
+            "chosen_labels": torch.randint(0, 32, (4, 8)),
+            "rejected_input_ids": torch.randint(0, 32, (4, 8)),
+            "rejected_attention_mask": torch.ones(4, 8, dtype=torch.long),
+            "rejected_labels": torch.randint(0, 32, (4, 8)),
+        }
+
+        loss_no_margin, _ = loss_fn_no_margin(model, batch)
+        loss_margin, _ = loss_fn_margin(model, batch)
+
+        # Margin subtracts from the reward difference, making the sigmoid smaller,
+        # which makes -log(sigmoid) larger
+        assert loss_margin.item() > loss_no_margin.item()
+
+    def test_accuracy_metric(self):
+        model = SimpleRewardModel()
+        loss_fn = RewardModelLoss()
+
+        batch = {
+            "chosen_input_ids": torch.randint(0, 32, (4, 8)),
+            "chosen_attention_mask": torch.ones(4, 8, dtype=torch.long),
+            "chosen_labels": torch.randint(0, 32, (4, 8)),
+            "rejected_input_ids": torch.randint(0, 32, (4, 8)),
+            "rejected_attention_mask": torch.ones(4, 8, dtype=torch.long),
+            "rejected_labels": torch.randint(0, 32, (4, 8)),
+        }
+
+        _, metrics = loss_fn(model, batch)
+        assert 0.0 <= metrics["accuracy"] <= 1.0
+
+    def test_creates_preference_collator(self):
+        loss_fn = RewardModelLoss()
+        from grimoire.data.preference import PreferenceCollator
+        collator = loss_fn.create_collator(pad_token_id=0)
+        assert isinstance(collator, PreferenceCollator)

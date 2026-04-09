@@ -27,6 +27,9 @@ class TrainingConfig:
     lr_scheduler: str = "cosine"  # "linear", "cosine", "constant", "constant_with_warmup"
     disable_dropout: bool = False
 
+    # Regularization
+    neftune_alpha: Optional[float] = None  # NEFTune noise scale (e.g. 5.0); None = disabled
+
     # Data loading
     dataloader_num_workers: int = 0
     dataloader_pin_memory: bool = True

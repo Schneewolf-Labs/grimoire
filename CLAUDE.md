@@ -29,9 +29,10 @@ grimoire/
 │   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
 │   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
 │   ├── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
-│   └── grpo.py        # GRPO loss (group relative policy optimization)
+│   ├── grpo.py        # GRPO loss (group relative policy optimization)
+│   └── reward.py      # Reward model loss (Bradley-Terry pairwise ranking)
 └── data/
-    ├── sft.py         # SFT collator + tokenization
+    ├── sft.py         # SFT collator + packed collator + tokenization
     ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
     ├── kto.py         # KTO collator + tokenization (unpaired feedback)
     ├── grpo.py        # GRPO collator + tokenization (prompt-only)
@@ -53,13 +54,16 @@ grimoire/
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
 - GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a clipped REINFORCE objective (requires ZeRO-2 or lower)
+- RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
+- NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
+- PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
 
 ## Usage
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss
-from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_grpo
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss, RewardModelLoss
+from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_grpo, PackedSFTCollator
 
 config = TrainingConfig(
     output_dir="./output",
@@ -142,6 +146,37 @@ trainer = GrimoireTrainer(
         epsilon=0.2,
     ),
     train_dataset=grpo_dataset,
+)
+trainer.train()
+
+# Reward Model — train a reward model on preference data
+from transformers import AutoModelForSequenceClassification
+reward_model = AutoModelForSequenceClassification.from_pretrained("model-name", num_labels=1)
+trainer = GrimoireTrainer(
+    model=reward_model, tokenizer=tokenizer, config=config,
+    loss_fn=RewardModelLoss(margin=0.0), train_dataset=pref_dataset,
+)
+trainer.train()
+
+# SFT with NEFTune — noisy embeddings for better chat quality
+config = TrainingConfig(
+    output_dir="./output",
+    neftune_alpha=5.0,  # noise scale (5-15 typical)
+    # ... other params
+)
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=SFTLoss(), train_dataset=dataset,
+)
+trainer.train()
+
+# SFT with sample packing — pack short sequences to minimize padding waste
+from grimoire.data import PackedSFTCollator
+packed_collator = PackedSFTCollator(pad_token_id=tokenizer.pad_token_id, max_length=2048)
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=SFTLoss(), train_dataset=dataset,
+    data_collator=packed_collator,  # overrides default collator
 )
 trainer.train()
 ```
@@ -258,6 +293,16 @@ beta       = KL penalty (default 0.04)
 epsilon    = clip ratio (default 0.2)
 ```
 
+## Reward Model Loss Formula
+
+```
+L_RM = -mean(log(sigmoid(r_chosen - r_rejected - margin)))
+
+r_chosen   = scalar reward for chosen sequence
+r_rejected = scalar reward for rejected sequence
+margin     = minimum reward gap to enforce (default 0.0)
+```
+
 ## Relationship to Merlina
 
 Grimoire is a standalone library that Merlina imports. Merlina handles:
@@ -268,7 +313,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, Reward Model)
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration

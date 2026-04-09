@@ -16,11 +16,14 @@ class SFTLoss:
         self.label_pad_token_id = label_pad_token_id
 
     def __call__(self, model, batch, training=True):
-        logits = model(
+        forward_kwargs = dict(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             use_cache=False,
-        ).logits
+        )
+        if "position_ids" in batch:
+            forward_kwargs["position_ids"] = batch["position_ids"]
+        logits = model(**forward_kwargs).logits
         labels = batch["labels"]
 
         shift_logits = logits[..., :-1, :]
