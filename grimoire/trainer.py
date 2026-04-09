@@ -10,8 +10,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from transformers import get_scheduler
-
 from .config import TrainingConfig
 
 
@@ -123,6 +121,214 @@ class Muon(torch.optim.Optimizer):
             self.adam_optimizer.zero_grad(set_to_none=set_to_none)
 
 logger = logging.getLogger(__name__)
+
+
+def _create_scheduler(name, optimizer, num_warmup_steps, num_training_steps):
+    """Create a learning rate scheduler by name.
+
+    Supported schedules: constant, constant_with_warmup, linear, cosine.
+    Pure PyTorch implementation — no transformers dependency.
+    """
+
+    def _warmup_then(current_step, after_warmup_fn):
+        if current_step < num_warmup_steps:
+            return current_step / max(1, num_warmup_steps)
+        return after_warmup_fn(current_step)
+
+    if name == "constant":
+
+        def lr_lambda(_):
+            return 1.0
+
+    elif name == "constant_with_warmup":
+
+        def lr_lambda(step):
+            return _warmup_then(step, lambda _: 1.0)
+
+    elif name == "linear":
+
+        def lr_lambda(step):
+            return _warmup_then(
+                step,
+                lambda s: max(
+                    0.0,
+                    (num_training_steps - s)
+                    / max(1, num_training_steps - num_warmup_steps),
+                ),
+            )
+
+    elif name == "cosine":
+
+        def lr_lambda(step):
+            return _warmup_then(
+                step,
+                lambda s: max(
+                    0.0,
+                    0.5
+                    * (
+                        1.0
+                        + math.cos(
+                            math.pi
+                            * (s - num_warmup_steps)
+                            / max(1, num_training_steps - num_warmup_steps)
+                        )
+                    ),
+                ),
+            )
+
+    else:
+        raise ValueError(
+            f"Unknown scheduler: {name}. "
+            "Choose from: linear, cosine, constant, constant_with_warmup"
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class Adafactor(torch.optim.Optimizer):
+    """Memory-efficient optimizer with factored second moment estimates.
+
+    Standalone implementation of Adafactor (Shazeer & Stern, 2018).
+    For 2D+ parameters, stores row and column second-moment factors instead
+    of the full matrix, reducing memory from O(mn) to O(m+n).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        eps=(1e-30, 1e-3),
+        clip_threshold=1.0,
+        decay_rate=-0.8,
+        beta1=None,
+        weight_decay=0.0,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+    ):
+        defaults = dict(
+            lr=lr,
+            eps=eps,
+            clip_threshold=clip_threshold,
+            decay_rate=decay_rate,
+            beta1=beta1,
+            weight_decay=weight_decay,
+            relative_step=relative_step,
+            scale_parameter=scale_parameter,
+            warmup_init=warmup_init,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _rms(tensor):
+        return tensor.norm(2) / (tensor.numel() ** 0.5)
+
+    @staticmethod
+    def _decay_rate(step, decay_rate):
+        return min(1.0 - step ** decay_rate, 1.0)
+
+    @staticmethod
+    def _rms_scale(param):
+        return max(1.0, param.norm(2) / (param.numel() ** 0.5))
+
+    @staticmethod
+    def _relative_lr(warmup_init, step):
+        if warmup_init:
+            return min(1e-6 * step, 1.0 / math.sqrt(step))
+        return min(1.0 / math.sqrt(step), 1.0)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            eps1, eps2 = group["eps"]
+            clip_threshold = group["clip_threshold"]
+            decay_rate = group["decay_rate"]
+            beta1 = group["beta1"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Adafactor does not support sparse gradients")
+
+                state = self.state[p]
+                factored = grad.dim() >= 2
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    if factored:
+                        state["exp_avg_sq_row"] = torch.zeros(
+                            grad.shape[:-1], dtype=grad.dtype, device=grad.device
+                        )
+                        state["exp_avg_sq_col"] = torch.zeros(
+                            grad.shape[:-2] + grad.shape[-1:],
+                            dtype=grad.dtype,
+                            device=grad.device,
+                        )
+                    else:
+                        state["exp_avg_sq"] = torch.zeros_like(grad)
+                    if beta1 is not None:
+                        state["exp_avg"] = torch.zeros_like(grad)
+
+                state["step"] += 1
+
+                # Compute learning rate
+                lr = group["lr"]
+                if group["relative_step"]:
+                    lr = lr * self._relative_lr(
+                        group["warmup_init"], state["step"]
+                    )
+                if group["scale_parameter"]:
+                    lr = lr * self._rms_scale(p)
+
+                # Second moment decay
+                rho = min(self._decay_rate(state["step"], decay_rate), 1.0 - eps2)
+
+                if factored:
+                    v_r = state["exp_avg_sq_row"]
+                    v_c = state["exp_avg_sq_col"]
+                    v_r.mul_(rho).add_(
+                        grad.pow(2).mean(dim=-1), alpha=1.0 - rho
+                    )
+                    v_c.mul_(rho).add_(
+                        grad.pow(2).mean(dim=-2), alpha=1.0 - rho
+                    )
+                    # Reconstruct: v ≈ (v_r / mean(v_r)) ⊗ v_c
+                    r_factor = (
+                        v_r / v_r.mean(dim=-1, keepdim=True).clamp(min=eps1)
+                    ).unsqueeze(-1)
+                    c_factor = v_c.unsqueeze(-2)
+                    update = grad * (r_factor * c_factor).rsqrt()
+                else:
+                    v = state["exp_avg_sq"]
+                    v.mul_(rho).add_(grad.pow(2), alpha=1.0 - rho)
+                    update = grad * v.clamp(min=eps1).rsqrt()
+
+                # RMS clipping
+                update_rms = self._rms(update)
+                if update_rms > 0:
+                    update.div_(max(1.0, update_rms / clip_threshold))
+
+                # Optional momentum
+                if beta1 is not None:
+                    state["exp_avg"].mul_(beta1).add_(update, alpha=1.0 - beta1)
+                    update = state["exp_avg"]
+
+                # Weight decay (decoupled)
+                if weight_decay > 0:
+                    p.add_(p, alpha=-weight_decay * lr)
+
+                p.add_(update, alpha=-lr)
+
+        return loss
 
 
 class GrimoireTrainer:
@@ -274,7 +480,7 @@ class GrimoireTrainer:
         self.max_steps = num_update_steps_per_epoch * config.num_epochs
 
         warmup_steps = config.warmup_steps if config.warmup_steps > 0 else int(self.max_steps * config.warmup_ratio)
-        lr_scheduler = get_scheduler(
+        lr_scheduler = _create_scheduler(
             config.lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=warmup_steps,
@@ -628,7 +834,6 @@ class GrimoireTrainer:
             import bitsandbytes as bnb
             return bnb.optim.PagedAdamW32bit(param_groups, lr=lr)
         elif opt == "adafactor":
-            from transformers.optimization import Adafactor
             return Adafactor(param_groups, lr=lr, relative_step=False, scale_parameter=False)
         elif opt == "muon":
             return self._create_muon_optimizer(model, lr)
