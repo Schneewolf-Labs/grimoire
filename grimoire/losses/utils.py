@@ -51,27 +51,16 @@ def _per_token_logps(shift_logits, safe_labels):
     (e.g. 152k) can produce subtly wrong values that lead to NaN gradients
     and CUDA errors downstream.  This matches TRL's selective_log_softmax.
 
-    Processes each row individually so CUDA kernels always get contiguous
-    memory (logits[:, :-1, :] is a non-contiguous view, but each row is
-    contiguous).
+    Uses fully vectorized batch operations to maximize GPU utilization.
     """
-    rows = []
+    idx = safe_labels.unsqueeze(2)  # [B, seq, 1]
     if shift_logits.dtype in (torch.float32, torch.float64):
-        for i in range(shift_logits.size(0)):
-            row_logits = shift_logits[i]
-            row_labels = safe_labels[i]
-            rows.append(
-                torch.gather(row_logits, dim=1, index=row_labels.unsqueeze(1)).squeeze(1)
-                - torch.logsumexp(row_logits, dim=-1)
-            )
+        gathered = torch.gather(shift_logits, dim=2, index=idx).squeeze(2)
+        return gathered - torch.logsumexp(shift_logits, dim=-1)
     else:
         # bf16 / fp16: F.log_softmax upcasts internally for stability
-        for i in range(shift_logits.size(0)):
-            row_logps = F.log_softmax(shift_logits[i], dim=-1)
-            rows.append(
-                torch.gather(row_logps, dim=1, index=safe_labels[i].unsqueeze(1)).squeeze(1)
-            )
-    return torch.stack(rows)
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        return torch.gather(log_probs, dim=2, index=idx).squeeze(2)
 
 
 def get_batch_logps(logits, labels, label_pad_token_id=-100):
@@ -96,13 +85,7 @@ def pad_dim1(tensor, length, value):
     """Pad a 2D tensor along dim=1 (sequence length) to the target length."""
     if tensor.size(1) >= length:
         return tensor
-    pad = torch.full(
-        (tensor.size(0), length - tensor.size(1)),
-        value,
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    return torch.cat([tensor, pad], dim=1)
+    return F.pad(tensor, (0, length - tensor.size(1)), value=value)
 
 
 def concatenate_preference(batch, pad_token_id, label_pad_token_id=-100):
