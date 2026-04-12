@@ -552,7 +552,63 @@ class GrimoireTrainer:
         )
         if self.accelerator.is_main_process:
             self.tokenizer.save_pretrained(output_dir)
+            self._fix_nested_state_dict_keys(output_dir)
             self._log_info(f"Model saved to {output_dir}")
+
+    @staticmethod
+    def _fix_nested_state_dict_keys(output_dir):
+        """Fix repeated .language_model nesting in saved VLM safetensors.
+
+        Some PEFT + VLM combinations produce keys like
+        model.language_model.language_model.language_model.layers.0...
+        This collapses repeated nesting and fixes visual keys saved under
+        the wrong prefix.
+        """
+        import re
+        _nested_re = re.compile(r"(\.language_model){2,}")
+        index_path = os.path.join(output_dir, "model.safetensors.index.json")
+        single_path = os.path.join(output_dir, "model.safetensors")
+
+        def _needs_fix(keys):
+            return any(_nested_re.search(k) or ".language_model.visual." in k for k in keys)
+
+        def _fix(key):
+            key = _nested_re.sub(".language_model", key)
+            if ".language_model.visual." in key:
+                key = key.replace(".language_model.visual.", ".visual.", 1)
+            return key
+
+        try:
+            from safetensors.torch import load_file, save_file
+            from collections import OrderedDict
+            import json as _json
+
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    index = _json.load(f)
+                if not _needs_fix(index["weight_map"]):
+                    return
+                new_map = {}
+                for shard_name in set(index["weight_map"].values()):
+                    shard_path = os.path.join(output_dir, shard_name)
+                    tensors = load_file(shard_path)
+                    fixed = OrderedDict((_fix(k), v) for k, v in tensors.items())
+                    save_file(fixed, shard_path)
+                    for new_key in fixed:
+                        new_map[new_key] = shard_name
+                index["weight_map"] = new_map
+                with open(index_path, "w") as f:
+                    _json.dump(index, f, indent=2, sort_keys=True)
+
+            elif os.path.exists(single_path):
+                tensors = load_file(single_path)
+                if not _needs_fix(tensors):
+                    return
+                fixed = OrderedDict((_fix(k), v) for k, v in tensors.items())
+                save_file(fixed, single_path)
+
+        except ImportError:
+            pass  # safetensors not available — skip
 
     # ---- Internal helpers ----
 
