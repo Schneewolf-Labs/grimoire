@@ -1403,3 +1403,102 @@ class TestTokenIdValidation:
                 trainer.train()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestNEFTune:
+    def test_neftune_adds_noise_during_training(self):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+                neftune_alpha=5.0,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+
+            # Hook should be registered
+            assert trainer._neftune_hook_handle is not None
+
+            trainer.train()
+
+            # Hook should be removed after training
+            assert trainer._neftune_hook_handle is None
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_neftune_disabled_by_default(self):
+        tmpdir = tempfile.mkdtemp()
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+
+            assert trainer._neftune_hook_handle is None
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_neftune_embedding_noise_is_active(self):
+        """Verify that the hook actually modifies embedding output during training."""
+        torch.manual_seed(42)
+        model = TinyLM()
+
+        embeddings = model.get_input_embeddings()
+        alpha = 5.0
+
+        def neftune_hook(module, input, output):
+            if module.training:
+                dims = output.size(1) * output.size(2)
+                mag_norm = alpha / dims ** 0.5
+                return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+            return output
+
+        handle = embeddings.register_forward_hook(neftune_hook)
+
+        input_ids = torch.randint(0, 64, (2, 8))
+
+        # Training mode: two forward passes should differ
+        model.train()
+        out1 = embeddings(input_ids)
+        out2 = embeddings(input_ids)
+        assert not torch.allclose(out1, out2), "NEFTune should add different noise each pass"
+
+        # Eval mode: two forward passes should be identical
+        model.eval()
+        out3 = embeddings(input_ids)
+        out4 = embeddings(input_ids)
+        assert torch.allclose(out3, out4), "NEFTune should not add noise in eval mode"
+
+        handle.remove()

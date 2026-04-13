@@ -1,7 +1,7 @@
 """Tests for data collators and tokenization utilities."""
 
 import pytest
-from grimoire.data.sft import SFTCollator, tokenize_sft
+from grimoire.data.sft import SFTCollator, PackedSFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
 from grimoire.data.kto import KTOCollator, tokenize_kto
 from grimoire.data.grpo import GRPOCollator, tokenize_grpo
@@ -44,6 +44,98 @@ class TestSFTCollator:
         assert batch["input_ids"].shape == (2, 3)
         # No padding needed
         assert (batch["attention_mask"] == 1).all()
+
+
+class TestPackedSFTCollator:
+    def test_packs_multiple_sequences(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=10)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [-100, 2, 3]},
+            {"input_ids": [4, 5], "attention_mask": [1, 1], "labels": [-100, 5]},
+            {"input_ids": [6, 7, 8], "attention_mask": [1, 1, 1], "labels": [-100, 7, 8]},
+        ]
+        batch = collator(features)
+
+        # All 3 sequences (total 8 tokens) fit in one row of max_length=10
+        assert batch["input_ids"].shape[0] <= 2  # packed into fewer rows
+        assert "position_ids" in batch
+        assert batch["input_ids"].shape == batch["position_ids"].shape
+
+    def test_position_ids_reset_at_boundaries(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=10)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]},
+            {"input_ids": [4, 5], "attention_mask": [1, 1], "labels": [4, 5]},
+        ]
+        batch = collator(features)
+
+        # Both sequences packed into one row
+        assert batch["input_ids"].shape[0] == 1
+        # Position IDs: [0,1,2] for first seq, [0,1] for second
+        pos = batch["position_ids"][0].tolist()
+        assert pos[:3] == [0, 1, 2]
+        assert pos[3:5] == [0, 1]
+
+    def test_overflow_creates_new_bin(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=4)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]},
+            {"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1], "labels": [4, 5, 6]},
+        ]
+        batch = collator(features)
+
+        # 3+3=6 > max_length=4, so two rows
+        assert batch["input_ids"].shape[0] == 2
+
+    def test_truncates_long_sequences(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=3)
+        features = [
+            {"input_ids": [1, 2, 3, 4, 5], "attention_mask": [1, 1, 1, 1, 1], "labels": [1, 2, 3, 4, 5]},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (1, 3)
+
+    def test_preserves_labels(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=10)
+        features = [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [-100, 2]},
+            {"input_ids": [3, 4], "attention_mask": [1, 1], "labels": [-100, 4]},
+        ]
+        batch = collator(features)
+
+        labels = batch["labels"][0].tolist()
+        # First seq labels: [-100, 2], second: [-100, 4]
+        assert labels[0] == -100
+        assert labels[1] == 2
+        assert labels[2] == -100
+        assert labels[3] == 4
+
+    def test_padding_uses_correct_values(self):
+        collator = PackedSFTCollator(pad_token_id=99, label_pad_token_id=-100, max_length=10)
+        features = [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [1, 2]},
+            {"input_ids": [3, 4, 5], "attention_mask": [1, 1, 1], "labels": [3, 4, 5]},
+        ]
+        batch = collator(features)
+
+        row = batch["input_ids"][0]
+        # Padding region should use pad_token_id=99
+        packed_len = 5  # 2 + 3
+        if row.shape[0] > packed_len:
+            assert (row[packed_len:] == 99).all()
+            assert (batch["labels"][0, packed_len:] == -100).all()
+            assert (batch["attention_mask"][0, packed_len:] == 0).all()
+
+    def test_single_sequence(self):
+        collator = PackedSFTCollator(pad_token_id=0, max_length=10)
+        features = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]},
+        ]
+        batch = collator(features)
+
+        assert batch["input_ids"].shape == (1, 3)
+        assert batch["position_ids"][0].tolist() == [0, 1, 2]
 
 
 class TestPreferenceCollator:

@@ -297,6 +297,11 @@ class GrimoireTrainer:
                 init_kwargs=tracker_kwargs,
             )
 
+        # NEFTune: add uniform noise to embeddings during training
+        self._neftune_hook_handle = None
+        if config.neftune_alpha is not None and config.neftune_alpha > 0:
+            self._neftune_hook_handle = self._register_neftune_hook(config.neftune_alpha)
+
         # Resume from checkpoint
         if config.resume_from_checkpoint:
             self.accelerator.load_state(config.resume_from_checkpoint)
@@ -454,6 +459,11 @@ class GrimoireTrainer:
         progress_bar.close()
         self._fire("on_train_end")
 
+        # Remove NEFTune hook so the model produces clean outputs for inference
+        if self._neftune_hook_handle is not None:
+            self._neftune_hook_handle.remove()
+            self._neftune_hook_handle = None
+
         if config.log_with:
             self.accelerator.end_training()
 
@@ -555,6 +565,24 @@ class GrimoireTrainer:
             self._log_info(f"Model saved to {output_dir}")
 
     # ---- Internal helpers ----
+
+    def _register_neftune_hook(self, alpha):
+        """Register a forward hook that adds uniform noise to embeddings during training.
+
+        NEFTune (Jain et al., 2023) adds noise scaled by alpha / sqrt(seq_len * hidden_dim)
+        to the embedding output. The hook is only active when the model is in training mode.
+        """
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        embeddings = unwrapped.get_input_embeddings()
+
+        def neftune_forward_hook(module, input, output):
+            if module.training:
+                dims = output.size(1) * output.size(2)
+                mag_norm = alpha / dims ** 0.5
+                return output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+            return output
+
+        return embeddings.register_forward_hook(neftune_forward_hook)
 
     def _validate_token_ids(self):
         """Check that dataset token IDs fit within the model's embedding table.
