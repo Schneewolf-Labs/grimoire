@@ -10,7 +10,6 @@ One training loop, pluggable loss functions. Adding a new training method means 
 
 - `accelerate` for multi-GPU / DeepSpeed / FSDP (NOT transformers.Trainer)
 - `peft` for LoRA
-- `transformers` for models and tokenizers
 - `torch` for everything else
 
 ## Structure
