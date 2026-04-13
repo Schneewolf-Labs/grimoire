@@ -23,6 +23,7 @@ class TrainingConfig:
     # Precision and optimization
     mixed_precision: str = "bf16"  # "no", "fp16", "bf16"
     gradient_checkpointing: bool = True
+    torch_compile: bool = False  # Wrap model with torch.compile for fused kernels
     optimizer: str = "adamw"  # "adamw", "adamw_8bit", "adafactor", "muon", "sgd"
     lr_scheduler: str = "cosine"  # "linear", "cosine", "constant", "constant_with_warmup"
     disable_dropout: bool = False
