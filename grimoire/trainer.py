@@ -380,6 +380,15 @@ class GrimoireTrainer:
                 )
                 model.resize_token_embeddings(len(tokenizer))
 
+        # Apply Liger Kernel patches (RMSNorm, RoPE, SwiGLU, GeGLU).  Must run
+        # before PEFT / kbit prep because those wrap or replace the modules
+        # Liger targets.  We disable the cross-entropy kernels since grimoire
+        # computes loss externally from logits — those kernels only activate
+        # when `labels` is passed to model.forward().  Stacks cleanly with
+        # bitsandbytes: bnb quantizes linears, Liger patches norms/activations.
+        if config.use_liger:
+            self._apply_liger_kernel(model)
+
         # Apply PEFT / LoRA
         if peft_config is not None:
             from peft import get_peft_model, prepare_model_for_kbit_training
@@ -827,6 +836,29 @@ class GrimoireTrainer:
             pass  # safetensors not available — skip
 
     # ---- Internal helpers ----
+
+    @staticmethod
+    def _apply_liger_kernel(model):
+        """Patch the model with Liger Kernel fused Triton ops.
+
+        Liger auto-detects the model architecture from ``model.config.model_type``
+        and patches supported layers in place (RMSNorm, RoPE, SwiGLU/GeGLU, etc).
+        CE kernels are disabled because grimoire computes loss from logits
+        externally — fused_linear_cross_entropy only activates when ``labels``
+        is passed to ``model.forward()``.
+        """
+        try:
+            from liger_kernel.transformers import _apply_liger_kernel_to_instance
+        except ImportError as e:
+            raise ImportError(
+                "use_liger=True requires liger-kernel. "
+                "Install with: pip install 'grimoire-rl[liger]'"
+            ) from e
+        _apply_liger_kernel_to_instance(
+            model=model,
+            cross_entropy=False,
+            fused_linear_cross_entropy=False,
+        )
 
     def _register_neftune_hook(self, alpha):
         """Register a forward hook that adds uniform noise to embeddings during training.

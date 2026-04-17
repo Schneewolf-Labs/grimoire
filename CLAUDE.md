@@ -56,6 +56,7 @@ grimoire/
 - RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
+- Liger Kernel (`use_liger=True`) patches RMSNorm/RoPE/SwiGLU/GeGLU with fused Triton kernels for ~20% speedup and ~60% less activation VRAM; CE kernels stay disabled since losses are computed externally from logits; stacks with bitsandbytes 4-bit + LoRA for low-VRAM QLoRA training
 
 ## Usage
 

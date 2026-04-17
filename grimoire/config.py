@@ -27,6 +27,7 @@ class TrainingConfig:
     optimizer: str = "adamw"  # "adamw", "adamw_8bit", "adafactor", "muon", "sgd"
     lr_scheduler: str = "cosine"  # "linear", "cosine", "constant", "constant_with_warmup"
     disable_dropout: bool = False
+    use_liger: bool = False  # Patch model with Liger Kernel fused ops (RMSNorm, RoPE, SwiGLU)
 
     # Regularization
     neftune_alpha: Optional[float] = None  # NEFTune noise scale (e.g. 5.0); None = disabled
