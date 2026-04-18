@@ -3,7 +3,9 @@
 import copy
 import os
 import shutil
+import sys
 import tempfile
+import types
 from contextlib import contextmanager
 
 import torch
@@ -1502,3 +1504,124 @@ class TestNEFTune:
         assert torch.allclose(out3, out4), "NEFTune should not add noise in eval mode"
 
         handle.remove()
+
+
+class TestLigerKernel:
+    def _install_fake_liger(self, monkeypatch, recorder):
+        """Install a stub liger_kernel.transformers module into sys.modules."""
+        def fake_apply(**kwargs):
+            recorder["called"] = True
+            recorder["kwargs"] = kwargs
+
+        pkg = types.ModuleType("liger_kernel")
+        submod = types.ModuleType("liger_kernel.transformers")
+        submod._apply_liger_kernel_to_instance = fake_apply
+        pkg.transformers = submod
+        monkeypatch.setitem(sys.modules, "liger_kernel", pkg)
+        monkeypatch.setitem(sys.modules, "liger_kernel.transformers", submod)
+
+    def test_use_liger_patches_model(self, monkeypatch):
+        torch.manual_seed(42)
+        tmpdir = tempfile.mkdtemp()
+        recorder = {}
+        self._install_fake_liger(monkeypatch, recorder)
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+                use_liger=True,
+            )
+
+            GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+
+            assert recorder.get("called"), "Liger apply function was not called"
+            # CE kernels must be disabled — grimoire computes loss externally.
+            assert recorder["kwargs"]["cross_entropy"] is False
+            assert recorder["kwargs"]["fused_linear_cross_entropy"] is False
+            assert recorder["kwargs"]["model"] is model
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_use_liger_disabled_by_default(self, monkeypatch):
+        tmpdir = tempfile.mkdtemp()
+        recorder = {}
+        self._install_fake_liger(monkeypatch, recorder)
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+            )
+
+            GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=config,
+                loss_fn=SFTLoss(),
+                train_dataset=dataset,
+            )
+
+            assert not recorder.get("called"), "Liger should not be called when use_liger=False"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_use_liger_raises_when_not_installed(self, monkeypatch):
+        tmpdir = tempfile.mkdtemp()
+        # Evict any real liger_kernel from sys.modules and block its import.
+        monkeypatch.delitem(sys.modules, "liger_kernel", raising=False)
+        monkeypatch.delitem(sys.modules, "liger_kernel.transformers", raising=False)
+
+        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+        def blocked_import(name, *args, **kwargs):
+            if name == "liger_kernel" or name.startswith("liger_kernel."):
+                raise ImportError("No module named 'liger_kernel'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", blocked_import)
+
+        try:
+            model = TinyLM()
+            dataset = make_sft_dataset(n=8)
+
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                save_on_epoch_end=False,
+                use_liger=True,
+            )
+
+            with pytest.raises(ImportError, match="liger-kernel"):
+                GrimoireTrainer(
+                    model=model,
+                    tokenizer=FakeTokenizer(),
+                    config=config,
+                    loss_fn=SFTLoss(),
+                    train_dataset=dataset,
+                )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
