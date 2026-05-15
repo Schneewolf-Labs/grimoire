@@ -707,8 +707,18 @@ class GrimoireTrainer:
         total_loss = 0.0
         total_metrics = {}
         num_batches = 0
+        eval_total = len(self.eval_dataloader)
+        log_every = max(1, eval_total // 10)
 
-        for batch in self.eval_dataloader:
+        eval_iter = tqdm(
+            self.eval_dataloader,
+            total=eval_total,
+            desc="Evaluating",
+            disable=not self.accelerator.is_main_process,
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for batch in eval_iter:
             loss, metrics = self.loss_fn(self.model, batch, training=False)
 
             # Reduce loss across all processes (average, not gather+mean)
@@ -723,6 +733,10 @@ class GrimoireTrainer:
                 for k, v in zip(keys, vals):
                     total_metrics[k] = total_metrics.get(k, 0.0) + v.item()
             num_batches += 1
+            eval_iter.set_postfix(loss=f"{total_loss / num_batches:.4f}")
+
+            if num_batches % log_every == 0:
+                self._log_info(f"  Eval progress: {num_batches}/{eval_total} — loss: {total_loss / num_batches:.4f}")
 
             del batch, loss, metrics
 
