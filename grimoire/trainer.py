@@ -473,14 +473,15 @@ class GrimoireTrainer:
 
         self.eval_dataloader = None
         if eval_dataset is not None:
+            eval_bs = config.eval_batch_size or config.batch_size
             self.eval_dataloader = DataLoader(
                 eval_dataset,
-                batch_size=config.batch_size,
+                batch_size=eval_bs,
                 shuffle=False,
                 collate_fn=data_collator,
                 num_workers=config.dataloader_num_workers,
                 pin_memory=config.dataloader_pin_memory,
-                drop_last=True,
+                drop_last=False,
             )
 
         # Optimizer
@@ -706,14 +707,30 @@ class GrimoireTrainer:
         self.model.eval()
         total_loss = 0.0
         total_metrics = {}
+        total_samples = 0
         num_batches = 0
+        eval_total = len(self.eval_dataloader)
+        log_every = max(1, eval_total // 10)
 
-        for batch in self.eval_dataloader:
+        eval_iter = tqdm(
+            self.eval_dataloader,
+            total=eval_total,
+            desc="Evaluating",
+            disable=not self.accelerator.is_main_process,
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for batch in eval_iter:
+            # Determine sample count before handing batch to loss_fn (which may delete keys)
+            batch_samples = next(iter(batch.values())).shape[0]
+
             loss, metrics = self.loss_fn(self.model, batch, training=False)
 
             # Reduce loss across all processes (average, not gather+mean)
             loss = self.accelerator.reduce(loss, reduction="mean")
-            total_loss += loss.item()
+            # Weight by sample count so eval/loss is invariant to eval_batch_size
+            total_loss += loss.item() * batch_samples
+            total_samples += batch_samples
 
             # Reduce metrics across all processes (batched into single tensor)
             if metrics:
@@ -721,13 +738,17 @@ class GrimoireTrainer:
                 vals = torch.tensor([metrics[k] for k in keys], device=self.accelerator.device)
                 vals = self.accelerator.reduce(vals, reduction="mean")
                 for k, v in zip(keys, vals):
-                    total_metrics[k] = total_metrics.get(k, 0.0) + v.item()
+                    total_metrics[k] = total_metrics.get(k, 0.0) + v.item() * batch_samples
             num_batches += 1
+            eval_iter.set_postfix(loss=f"{total_loss / max(total_samples, 1):.4f}")
+
+            if num_batches % log_every == 0:
+                self._log_info(f"  Eval progress: {num_batches}/{eval_total} — loss: {total_loss / max(total_samples, 1):.4f}")
 
             del batch, loss, metrics
 
-        avg_loss = total_loss / max(num_batches, 1)
-        avg_metrics = {k: v / max(num_batches, 1) for k, v in total_metrics.items()}
+        avg_loss = total_loss / max(total_samples, 1)
+        avg_metrics = {k: v / max(total_samples, 1) for k, v in total_metrics.items()}
 
         eval_results = {"eval/loss": avg_loss, **{f"eval/{k}": v for k, v in avg_metrics.items()}}
 

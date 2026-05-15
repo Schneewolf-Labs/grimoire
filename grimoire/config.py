@@ -47,6 +47,7 @@ class TrainingConfig:
     # Evaluation
     eval_steps: Optional[int] = None
     eval_on_start: bool = False
+    eval_batch_size: Optional[int] = None  # falls back to batch_size if None
 
     # Checkpointing
     save_steps: Optional[int] = None
