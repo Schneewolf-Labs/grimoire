@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-20
+
+### Added
+- **`eval_batch_size`** config field (`Optional[int]`, defaults to `None` → falls back to `batch_size`). Decouples evaluation batch size from training; eval has no optimizer state and grad-checkpointing is disabled during `evaluate()`, so it can typically run much larger batches than training. Backwards-compatible: setting `None` preserves prior behavior.
+
+### Fixed
+- **Sample-weighted eval averaging**: `eval/loss` now aggregates by sample count rather than batch count, so the reported number is invariant to `eval_batch_size`. Previously a ragged final batch (under `drop_last=False`) would slightly bias the mean; runs with different eval batch sizes were not directly comparable.
+
+## [1.1.1] - 2026-05-18
+
+### Added
+- **`tqdm` progress bar in `evaluate()`** with `desc="Evaluating"`, `disable` on non-main processes, `leave=False`. Long held-out evals (especially in VLM / large-corpus settings) are no longer silent; the postfix surfaces the running loss.
+
 ## [1.0.0] - 2026-03-15
 
 ### Added
