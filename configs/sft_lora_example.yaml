@@ -1,0 +1,61 @@
+# Example: SFT LoRA on a small Llama / Qwen model.
+#
+# Run with:
+#   python -m grimoire.train --config configs/sft_lora_example.yaml
+#
+# Override anything on the CLI without editing the file:
+#   python -m grimoire.train --config configs/sft_lora_example.yaml \
+#       --set training.num_epochs=2 \
+#       --set 'peft.target_modules=["q_proj","v_proj"]'
+
+model:
+  pretrained: "meta-llama/Llama-3.2-3B-Instruct"
+  model_kwargs:
+    torch_dtype: "bfloat16"
+    attn_implementation: "sdpa"
+
+# Uncomment for 4-bit QLoRA on a smaller GPU:
+# quantization:
+#   load_in_4bit: true
+#   bnb_4bit_compute_dtype: "bfloat16"
+#   bnb_4bit_quant_type: "nf4"
+#   bnb_4bit_use_double_quant: true
+
+dataset:
+  name: "HuggingFaceH4/ultrachat_200k"
+  split: "train_sft"
+  max_samples: 5000
+  tokenize:
+    type: "sft"
+    max_length: 2048
+    text_field: "messages"   # depends on the dataset shape
+
+loss:
+  type: "sft"
+
+peft:
+  type: "lora"
+  r: 32
+  lora_alpha: 64
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  init_lora_weights: "gaussian"
+
+training:
+  output_dir: "./output"
+  num_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  optimizer: "adafactor"
+  lr_scheduler: "cosine"
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 3
+  save_on_epoch_end: true
+  seed: 42

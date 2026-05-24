@@ -122,6 +122,31 @@ trainer = GrimoireTrainer(
 - **[Multi-GPU, DeepSpeed, and FSDP](docs/deepspeed.md)** — Distributed training setup, example configs, and memory tips
 - **[Writing a Custom Loss](docs/custom-loss.md)** — How to add a new training method
 
+## YAML config + CLI
+
+For orchestrators (Merlina) or when you don't want to write a Python wrapper
+per run, train from a YAML config:
+
+```bash
+pip install -e ".[yaml]"
+python -m grimoire.train --config configs/sft_lora_example.yaml
+
+# Override anything on the CLI (JSON-decoded values):
+python -m grimoire.train --config configs/my.yaml \
+    --set training.num_epochs=2 \
+    --set 'peft.target_modules=["q_proj","v_proj"]'
+```
+
+The YAML schema mirrors the Python API one-for-one — `loss.type` picks from
+`grimoire.registry.LOSSES`, `dataset.tokenize.type` picks from `TOKENIZERS`,
+`peft` becomes a `LoraConfig`, `training` becomes a `TrainingConfig`, and
+`dataset` accepts an HF hub name, a local JSONL, or a `load_from_disk` path.
+
+The shape is intentionally parallel to [Atelier](https://github.com/Schneewolf-Labs/atelier)'s
+CLI so Merlina drives both diffusion and LLM training with a uniform interface.
+See `grimoire/train.py` for the full schema and `configs/sft_lora_example.yaml`
+for a worked example.
+
 ## Multi-GPU
 
 No code changes. Configure with `accelerate` and launch:
