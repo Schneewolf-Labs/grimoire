@@ -702,7 +702,15 @@ class GrimoireTrainer:
         # its disable_gradient_checkpointing context manager.
         grad_ckpt_was_enabled = getattr(self.model, "is_gradient_checkpointing", False)
         if grad_ckpt_was_enabled:
-            self.model.gradient_checkpointing_disable()
+            try:
+                self.model.gradient_checkpointing_disable()
+            except ValueError as e:
+                # Wrapper model doesn't expose grad-ckpt at the outer level
+                # (e.g. a VLM wrapper that forgot to delegate). Skip the toggle;
+                # grad-ckpt stays on through eval (no correctness impact, just a
+                # small memory overhead) and training resumes normally.
+                self._log_info(f"  Skipping grad-ckpt disable for eval: {e}")
+                grad_ckpt_was_enabled = False
 
         self.model.eval()
         total_loss = 0.0
@@ -758,9 +766,14 @@ class GrimoireTrainer:
 
         # Restore gradient checkpointing and training mode
         if grad_ckpt_was_enabled:
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
+            try:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except ValueError as e:
+                # Same defensive guard as the disable side — if the model
+                # rejects the wrapper-level toggle, log and continue.
+                self._log_info(f"  Could not re-enable grad-ckpt after eval: {e}")
         self.model.train()
 
         # Defragment CUDA memory before returning to training.
