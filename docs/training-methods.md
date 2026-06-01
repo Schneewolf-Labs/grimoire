@@ -239,49 +239,56 @@ undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 
 Group Relative Policy Optimization. Generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
 
+Unlike the other methods, GRPO uses a **dedicated `GRPOTrainer`** (not `GrimoireTrainer`) because online RL is stateful: the trainer owns rollout generation, reward scoring, and advantage computation. `GRPOLoss` itself is a **pure tensor→scalar function** — the trainer feeds it precomputed log-probs and advantages. The reward enters as one synchronous `reward_fn` callable.
+
 - **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
-- **Memory:** Very high (generation + two forward passes per batch)
-- **Key params:** `reward_fn` — callable `(prompts, completions) → list[float]`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
+- **Memory:** Very high (generation + multiple forward passes per batch)
+- **Key params:** `reward_fn` — callable `(prompts, completions, **columns) → list[float]`; `num_generations` (default 8, on `GRPOConfig`) — completions per prompt; `beta` (default 0.04, on `GRPOLoss`) — KL penalty (0 disables the reference forward); `epsilon` (default 0.2) — clip ratio; `loss_type` (`"grpo"`/`"dr_grpo"`); `scale_rewards`
+- **Reference model:** free under LoRA (disabled adapter); a frozen copy is made only when `peft_config is None` and `beta > 0`
 - **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access
 
 ```python
-import copy
+from grimoire import GRPOTrainer, GRPOConfig
 from grimoire.losses import GRPOLoss
-from grimoire.data import tokenize_grpo
+from grimoire.data import tokenize_prompt
 
-# Dataset needs only prompts — no responses required
+# Dataset needs only prompts — no responses required. Keep the original columns
+# (do NOT remove_columns) so the reward fn can receive them via **columns.
 dataset = dataset.map(
-    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
-    remove_columns=dataset.column_names,
+    lambda x: tokenize_prompt(x, tokenizer, max_prompt_length=512),
 )
 
-def reward_fn(prompts, completions):
-    # Return a score for each (prompt, completion) pair
-    return [score_completion(p, c) for p, c in zip(prompts, completions)]
+def reward_fn(prompts, completions, **columns):
+    # prompts: length B; completions: length B*num_generations (group-major);
+    # columns: each list aligned to completions. Return one float per completion.
+    return [score_completion(c) for c in completions]
 
-trainer = GrimoireTrainer(
+config = GRPOConfig(
+    output_dir="./output",
+    num_generations=8,
+    max_completion_length=512,
+    # ... plus any TrainingConfig field
+)
+trainer = GRPOTrainer(
     model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
-        reward_fn=reward_fn,
-        tokenizer=tokenizer,
-        num_generations=4,
-        beta=0.04,
-        epsilon=0.2,
-        max_new_tokens=512,
-    ),
+    loss_fn=GRPOLoss(beta=0.04, epsilon=0.2, loss_type="grpo", scale_rewards=True),
+    reward_fn=reward_fn,
     train_dataset=dataset,
+    peft_config=lora_config,  # optional; LoRA gives a free reference policy
 )
 trainer.train()
 ```
 
 **Loss formula:**
 ```
-L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
+L_GRPO = aggregate_t( -min(ratio * A, clip(ratio, 1-epsilon, 1+epsilon) * A) + beta * KL )
 
-ratio         = pi(y|x) / pi_old(y|x)
-clipped_ratio = clamp(ratio, 1-epsilon, 1+epsilon)
-advantages    = (r - mean(r_group)) / std(r_group)   # normalized within group of G
-KL            = mean(log_pi_old(y|x) - log_pi(y|x))
+ratio = exp(logprobs - old_logprobs)              # per completion token
+A     = advantages                                # per sequence (group-normalized)
+KL    = exp(ref - logprobs) - (ref - logprobs) - 1   # k3 estimator, non-negative
+
+# advantages (trainer-side): A = r - mean(r_group), optionally / (std(r_group) + 1e-4)
+# aggregate_t: "grpo" length-normalizes per sequence; "dr_grpo" divides by a constant
 ```
 
 ## Quick Reference
@@ -295,7 +302,7 @@ KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 | DPO | Paired | Yes | High | Standard preference alignment |
 | IPO | Paired | Yes | High | Noisy preference data |
 | KTO | Unpaired | Yes | High | Binary feedback (no pairs) |
-| GRPO | Prompts only | No | Very high | Verifiable reward signal (math, code) |
+| GRPO | Prompts only | Optional (β>0) | Very high | Verifiable reward signal (math, code) |
 
 ## Typical Training Pipelines
 

@@ -4,7 +4,7 @@ import pytest
 from grimoire.data.sft import SFTCollator, PackedSFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
 from grimoire.data.kto import KTOCollator, tokenize_kto
-from grimoire.data.grpo import GRPOCollator, tokenize_grpo
+from grimoire.data.grpo import PromptCollator, tokenize_prompt
 
 
 class TestSFTCollator:
@@ -353,9 +353,9 @@ class TestTokenizeKTO:
         assert tokenize_kto(undesirable, mock_tokenizer)["kto_label"] is False
 
 
-class TestGRPOCollator:
-    def test_pads_to_max_length(self):
-        collator = GRPOCollator(pad_token_id=0)
+class TestPromptCollator:
+    def test_left_pads_to_max_length(self):
+        collator = PromptCollator(pad_token_id=0)
         features = [
             {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
             {"input_ids": [4, 5], "attention_mask": [1, 1]},
@@ -365,20 +365,20 @@ class TestGRPOCollator:
         assert batch["input_ids"].shape == (2, 3)
         assert batch["attention_mask"].shape == (2, 3)
 
-        # Second sequence should be padded
-        assert batch["input_ids"][1].tolist() == [4, 5, 0]
-        assert batch["attention_mask"][1].tolist() == [1, 1, 0]
+        # Shorter sequence is LEFT-padded so prompts end at the same column.
+        assert batch["input_ids"][1].tolist() == [0, 4, 5]
+        assert batch["attention_mask"][1].tolist() == [0, 1, 1]
 
     def test_no_labels_in_output(self):
-        """GRPO collator should not produce labels (prompt-only)."""
-        collator = GRPOCollator(pad_token_id=0)
+        """Prompt collator should not produce labels (prompt-only)."""
+        collator = PromptCollator(pad_token_id=0)
         features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
         batch = collator(features)
 
         assert "labels" not in batch
 
     def test_single_element_batch(self):
-        collator = GRPOCollator(pad_token_id=0)
+        collator = PromptCollator(pad_token_id=0)
         features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
         batch = collator(features)
 
@@ -386,7 +386,7 @@ class TestGRPOCollator:
         assert batch["input_ids"][0].tolist() == [1, 2]
 
     def test_equal_lengths_no_padding(self):
-        collator = GRPOCollator(pad_token_id=0)
+        collator = PromptCollator(pad_token_id=0)
         features = [
             {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
             {"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1]},
@@ -395,6 +395,25 @@ class TestGRPOCollator:
 
         assert batch["input_ids"].shape == (2, 3)
         assert (batch["attention_mask"] == 1).all()
+
+    def test_passes_through_extra_columns(self):
+        """Non-tensor columns are collected under batch['columns'] for the reward fn."""
+        collator = PromptCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "solution": "a"},
+            {"input_ids": [3, 4], "attention_mask": [1, 1], "solution": "b"},
+        ]
+        batch = collator(features)
+
+        assert "columns" in batch
+        assert batch["columns"]["solution"] == ["a", "b"]
+
+    def test_no_columns_key_when_no_extras(self):
+        collator = PromptCollator(pad_token_id=0)
+        features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
+        batch = collator(features)
+
+        assert "columns" not in batch
 
 
 class TestTokenizeSFTTruncation:
@@ -507,10 +526,12 @@ class TestTokenizeKTOCustomFields:
         assert result2["kto_label"] is False
 
 
-class TestTokenizeGRPO:
+class TestTokenizePrompt:
     @pytest.fixture
     def mock_tokenizer(self):
         class MockTokenizer:
+            chat_template = None  # force the raw-prompt path
+
             def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
                 ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
                 return {"input_ids": ids, "attention_mask": [1] * len(ids)}
@@ -518,7 +539,7 @@ class TestTokenizeGRPO:
 
     def test_produces_correct_keys(self, mock_tokenizer):
         example = {"prompt": "hello"}
-        result = tokenize_grpo(example, mock_tokenizer)
+        result = tokenize_prompt(example, mock_tokenizer)
 
         assert "input_ids" in result
         assert "attention_mask" in result
@@ -526,19 +547,41 @@ class TestTokenizeGRPO:
 
     def test_tokenizes_prompt_only(self, mock_tokenizer):
         example = {"prompt": "AB"}
-        result = tokenize_grpo(example, mock_tokenizer)
+        result = tokenize_prompt(example, mock_tokenizer)
 
         assert result["input_ids"] == [ord("A"), ord("B")]
         assert result["attention_mask"] == [1, 1]
 
     def test_respects_max_prompt_length(self, mock_tokenizer):
         example = {"prompt": "ABCDEF"}
-        result = tokenize_grpo(example, mock_tokenizer, max_prompt_length=3)
+        result = tokenize_prompt(example, mock_tokenizer, max_prompt_length=3)
 
         assert len(result["input_ids"]) == 3
 
     def test_custom_prompt_field(self, mock_tokenizer):
         example = {"question": "AB"}
-        result = tokenize_grpo(example, mock_tokenizer, prompt_field="question")
+        result = tokenize_prompt(example, mock_tokenizer, prompt_key="question")
 
         assert result["input_ids"] == [ord("A"), ord("B")]
+
+    def test_passes_through_original_columns(self, mock_tokenizer):
+        example = {"prompt": "AB", "solution": "42"}
+        result = tokenize_prompt(example, mock_tokenizer)
+
+        assert result["solution"] == "42"
+
+    def test_applies_chat_template_when_available(self):
+        class ChatTokenizer:
+            chat_template = "exists"
+
+            def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True):
+                # Encode role + content lengths into a deterministic token list.
+                assert add_generation_prompt and tokenize
+                return [len(m["content"]) for m in messages]
+
+        result = tokenize_prompt(
+            {"prompt": "abc", "system": "hi"}, ChatTokenizer(),
+        )
+        # system ("hi" -> 2) then user ("abc" -> 3)
+        assert result["input_ids"] == [2, 3]
+        assert result["attention_mask"] == [1, 1]

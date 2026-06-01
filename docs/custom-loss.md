@@ -121,16 +121,17 @@ def create_collator(self, pad_token_id):
     return KTOCollator(pad_token_id=pad_token_id)
 ```
 
-### GRPOCollator
+### PromptCollator
 
-For prompt-only data. Produces `input_ids` and `attention_mask` with no labels — completions are generated during training.
+For prompt-only data (GRPO). LEFT-pads `input_ids`/`attention_mask` (no labels) so every prompt ends at the same column — completions are generated during training. Extra dataset columns are passed through under `batch["columns"]` for the reward function.
 
 ```python
-from grimoire.data.grpo import GRPOCollator
+from grimoire.data.grpo import PromptCollator
 
-def create_collator(self, pad_token_id):
-    return GRPOCollator(pad_token_id=pad_token_id)
+collator = PromptCollator(pad_token_id=pad_token_id)
 ```
+
+Note: GRPO is driven by `GRPOTrainer` (not a `create_collator`-style loss). See the GRPO section in `training-methods.md`.
 
 ### Writing a Custom Collator
 

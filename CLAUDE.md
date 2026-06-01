@@ -17,8 +17,10 @@ One training loop, pluggable loss functions. Adding a new training method means 
 ```
 grimoire/
 ├── __init__.py        # Public API
-├── config.py          # TrainingConfig dataclass
+├── config.py          # TrainingConfig dataclass + GRPOConfig subclass
 ├── trainer.py         # GrimoireTrainer — the training loop
+├── grpo_trainer.py    # GRPOTrainer — online RL loop (rollout + reward + advantages)
+├── rewards.py         # RewardFn Protocol (the reward membrane; no concrete impls)
 ├── callbacks.py       # TrainerCallback base class
 ├── losses/
 │   ├── sft.py         # SFT loss (NLL on target tokens)
@@ -28,13 +30,13 @@ grimoire/
 │   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
 │   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
 │   ├── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
-│   ├── grpo.py        # GRPO loss (group relative policy optimization)
+│   ├── grpo.py        # GRPO loss (PURE tensor->scalar; GRPOTrainer feeds it)
 │   └── reward.py      # Reward model loss (Bradley-Terry pairwise ranking)
 └── data/
     ├── sft.py         # SFT collator + packed collator + tokenization
     ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
     ├── kto.py         # KTO collator + tokenization (unpaired feedback)
-    ├── grpo.py        # GRPO collator + tokenization (prompt-only)
+    ├── grpo.py        # PromptCollator (left-pad) + tokenize_prompt (prompt-only)
     └── cache.py       # cache_reference_log_probs() utility
 ```
 
@@ -52,7 +54,10 @@ grimoire/
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
-- GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a clipped REINFORCE objective (requires ZeRO-2 or lower)
+- GRPO is the one exception to "one trainer, pluggable loss": online RL is stateful, so `GRPOTrainer` (a `GrimoireTrainer` subclass) owns rollout generation, reward scoring, advantage computation, and reference/old-policy forwards, while `GRPOLoss` stays a PURE `tensor->scalar` function. The base `GrimoireTrainer.train()` calls a `_train_batch(batch)` hook that `GRPOTrainer` overrides
+- GRPO reward enters as ONE synchronous `RewardFn` callable (a Protocol in `grimoire.rewards`); grimoire never knows whether it's a regex, a network judge, or sandboxed code — Merlina builds/contains that behind the sync interface. Non-finite rewards are clamped to 0.0 with a warning
+- GRPO reference policy is FREE under LoRA (disable the adapter -> base = reference); a frozen deepcopy is made only when `peft_config is None` and `beta > 0`. `beta == 0` skips reference logprobs entirely. Requires ZeRO-2 or lower (generation needs full weights)
+- GRPO datasets are prompt-only; `PromptCollator` LEFT-pads so the prompt/completion boundary is uniform after `generate()`, and passes extra columns through `batch["columns"]` to the reward fn
 - RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
@@ -61,9 +66,9 @@ grimoire/
 ## Usage
 
 ```python
-from grimoire import GrimoireTrainer, TrainingConfig
+from grimoire import GrimoireTrainer, GRPOTrainer, TrainingConfig, GRPOConfig
 from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss, RewardModelLoss
-from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_grpo, PackedSFTCollator
+from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_prompt, PackedSFTCollator
 
 config = TrainingConfig(
     output_dir="./output",
@@ -131,21 +136,33 @@ trainer = GrimoireTrainer(
 )
 trainer.train()
 
-# GRPO — online RL with a reward function (no pre-labeled data needed)
+# GRPO — online RL with a reward function (no pre-labeled data needed).
+# Uses a dedicated GRPOTrainer + GRPOConfig; the loss is a PURE function and
+# the reward enters as one synchronous callable (the trainer owns the rollout).
 grpo_dataset = dataset.map(
-    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
-    remove_columns=dataset.column_names,
+    lambda x: tokenize_prompt(x, tokenizer, max_prompt_length=512),
+    # NOTE: do NOT remove_columns — the reward fn receives them via **columns
 )
-trainer = GrimoireTrainer(
-    model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
-        reward_fn=my_reward_fn,  # callable: (prompts, completions) -> list[float]
-        tokenizer=tokenizer,
-        num_generations=4,
-        beta=0.04,
-        epsilon=0.2,
-    ),
+
+def my_reward_fn(prompts, completions, **columns):
+    # prompts: length B, completions: length B*num_generations (group-major),
+    # columns: each list aligned to completions. Return one float per completion.
+    return [float(len(c)) for c in completions]
+
+grpo_config = GRPOConfig(
+    output_dir="./output",
+    num_generations=8,        # G — completions sampled per prompt
+    max_completion_length=256,
+    temperature=1.0,
+    num_iterations=1,         # PPO inner epochs; 1 => old policy == sampling policy
+    # ... plus any TrainingConfig field (batch_size, learning_rate, ...)
+)
+trainer = GRPOTrainer(
+    model=model, tokenizer=tokenizer, config=grpo_config,
+    loss_fn=GRPOLoss(beta=0.04, epsilon=0.2, loss_type="grpo", scale_rewards=True),
+    reward_fn=my_reward_fn,
     train_dataset=grpo_dataset,
+    peft_config=lora_config,  # LoRA => reference = disabled adapter (no second model)
 )
 trainer.train()
 
@@ -277,20 +294,30 @@ beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
 
 ## GRPO Loss Formula
 
+`GRPOLoss` is a PURE function of precomputed per-token logprobs + per-sequence
+advantages (the trainer produces all inputs):
+
 ```
-L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
+L_GRPO = aggregate_t( -min(ratio * A, clip(ratio, 1-eps, 1+eps) * A) + beta * KL )
 
-ratio         = pi(y|x) / pi_old(y|x)
-clipped_ratio = clamp(ratio, 1 - epsilon, 1 + epsilon)
-advantages    = (r - mean(r_group)) / std(r_group)  (normalized within group of G)
-KL            = mean(log_pi_old(y|x) - log_pi(y|x))
+ratio  = exp(logprobs - old_logprobs)             (per completion token)
+A      = advantages                               (per sequence, broadcast over tokens)
+KL     = exp(ref - logprobs) - (ref - logprobs) - 1   (k3 estimator, non-negative)
 
-pi         = policy model (being trained)
-pi_old     = generation policy (same model, frozen during this step)
-r          = reward scores from reward_fn
-G          = num_generations (completions per prompt)
-beta       = KL penalty (default 0.04)
-epsilon    = clip ratio (default 0.2)
+advantages (trainer-side, group of G):
+    grpo     (scale_rewards=True):  A = (r - mean(r_group)) / (std(r_group) + 1e-4)
+    dr_grpo  (scale_rewards=False): A = r - mean(r_group)            (mean-center only)
+
+aggregate_t:
+    grpo     -> per-sequence length normalization, then mean over sequences
+    dr_grpo  -> divide by a constant (padded completion width); no length norm
+
+pi/logprobs     = policy model (being trained)
+pi_old          = sampling policy; == logprobs.detach() when num_iterations == 1
+ref             = reference policy (disabled LoRA adapter, or frozen copy); None iff beta == 0
+G               = num_generations (completions per prompt)
+beta            = KL penalty (default 0.04; 0 disables KL + reference forward)
+epsilon         = clip range (default 0.2; only bites when num_iterations > 1)
 ```
 
 ## Reward Model Loss Formula

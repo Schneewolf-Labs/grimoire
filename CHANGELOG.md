@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- **`GRPOTrainer`** (`grimoire.GRPOTrainer`) — a dedicated online-RL trainer (subclass of `GrimoireTrainer`) that owns the GRPO rollout loop: samples `num_generations` completions per prompt via HuggingFace `.generate()`, scores them through one synchronous `reward_fn`, computes group-relative advantages, runs current/old/reference forward passes, and emits `reward/mean`, `reward/std`, `kl`, `clip_frac`, `ratio_mean`, and `completion_length/mean` to callbacks (plus `trainer.sample_completions` for streaming prompt/completion/reward rows). The reference policy is free under LoRA (disabled adapter); a frozen deepcopy is made only when `peft_config is None` and `beta > 0`.
+- **`GRPOConfig`** (`grimoire.GRPOConfig`) — `TrainingConfig` subclass adding rollout knobs (`num_generations`, `generation_batch_size`, `max_completion_length`, `temperature`, `top_p`, `top_k`), `num_iterations` (PPO inner epochs), and a `use_vllm` flag (raises `NotImplementedError` for now; HF `.generate()` is the supported backend).
+- **`RewardFn`** Protocol (`grimoire.rewards`) — the synchronous reward contract; grimoire defines only the Protocol, concrete rewards live in the caller. Non-finite rewards are clamped to `0.0` with a warning.
+- **`tokenize_prompt`** + **`PromptCollator`** (`grimoire.data`) — prompt-only tokenization with optional chat-template rendering and column passthrough; `PromptCollator` LEFT-pads so the prompt/completion boundary stays uniform after generation and forwards extra columns under `batch["columns"]`.
+- **`GrimoireTrainer._train_batch(batch)`** hook — the base `train()` loop now delegates the per-batch optimization step to this method, which `GRPOTrainer` overrides for stateful rollouts.
+
+### Changed
+- **BREAKING — `GRPOLoss` is now a PURE function.** It no longer owns generation/reward/collation. The signature is now keyword-only tensors (`logprobs`, `old_logprobs`, `ref_logprobs`, `advantages`, `completion_mask`) returning a `GRPOLossOutput` (`.loss`, `.kl`, `.clip_frac`, `.ratio_mean`), and it gains `loss_type` (`"grpo"`/`"dr_grpo"`) and `scale_rewards` options. Drive GRPO through `GRPOTrainer` + `reward_fn` instead of `GrimoireTrainer`. Removed `GRPOCollator`/`tokenize_grpo` (use `PromptCollator`/`tokenize_prompt`); the `grpo` tokenizer registry entry now points at `tokenize_prompt`.
+
 ## [1.2.0] - 2026-05-20
 
 ### Added

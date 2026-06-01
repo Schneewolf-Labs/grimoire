@@ -28,7 +28,8 @@ TOKENIZERS: dict[str, str] = {
     "sft":        "grimoire.data.sft:tokenize_sft",
     "preference": "grimoire.data.preference:tokenize_preference",
     "kto":        "grimoire.data.kto:tokenize_kto",
-    "grpo":       "grimoire.data.grpo:tokenize_grpo",
+    "grpo":       "grimoire.data.grpo:tokenize_prompt",
+    "prompt":     "grimoire.data.grpo:tokenize_prompt",
 }
 
 

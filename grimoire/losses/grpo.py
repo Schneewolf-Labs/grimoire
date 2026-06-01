@@ -1,163 +1,120 @@
+from dataclasses import dataclass
+from typing import Literal, Optional
+
 import torch
 
-from ..data.grpo import GRPOCollator
-from .utils import get_batch_logps, _disable_grad_checkpointing
+
+@dataclass
+class GRPOLossOutput:
+    """Result of a GRPOLoss call.
+
+    ``loss`` is a scalar tensor (carries grad). The remaining fields are detached
+    Python floats that the trainer forwards to callbacks for logging.
+    """
+
+    loss: torch.Tensor
+    kl: float
+    clip_frac: float
+    ratio_mean: float
 
 
 class GRPOLoss:
-    """GRPO (Group Relative Policy Optimization) loss.
+    """Group-Relative Policy Optimization loss (DeepSeekMath / Dr.GRPO variants).
 
-    Paper: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models"
-           arXiv:2402.03300
+    Paper: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open
+           Language Models" (arXiv:2402.03300) and "Understanding R1-Zero-Like
+           Training: A Critical Perspective" (Dr.GRPO, arXiv:2503.20783).
 
-    Generates G completions per prompt, scores them with a reward function,
-    computes group-relative advantages, and optimizes with a clipped
-    REINFORCE-style objective (like PPO but without a value function).
+    This is a PURE function of precomputed per-token log-probabilities and
+    per-sequence advantages — no model, no generation, no I/O. ``GRPOTrainer``
+    produces all the inputs (rollout generation + forward passes) and calls this
+    to turn them into a scalar.
 
-    Loss = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
+        L_GRPO = mean_t( -min(ratio * A, clip(ratio, 1-eps, 1+eps) * A) + beta * KL )
 
-    where ratio = pi(y|x) / pi_old(y|x), advantages are normalized within
-    each group of G completions, and KL is estimated from the generation policy.
+        ratio = exp(logprobs - old_logprobs)          (per token)
+        A     = advantages                            (per sequence, broadcast)
+        KL    = exp(ref - logprobs) - (ref - logprobs) - 1   (k3 estimator)
 
-    Note: GRPO requires ZeRO-2 or lower (or FSDP), not ZeRO-3, because
-    model.generate() needs full weight access.
+    Args:
+        beta:       KL penalty coefficient toward the reference policy. 0.0
+                    disables the KL term entirely (and lets the trainer skip
+                    reference log-probs / pass ``ref_logprobs=None``).
+        epsilon:    PPO-style clip range for the importance ratio (default 0.2).
+                    Only matters when num_iterations > 1 (old != current policy);
+                    when they are equal the ratio is exactly 1 and nothing clips.
+        loss_type:  "grpo"    -> per-sequence length normalization (original).
+                    "dr_grpo" -> divide by a constant (padded completion width),
+                                 no per-sequence length normalization (bias-corrected).
+        scale_rewards: documents the advantage contract for the two variants.
+                    True (GRPO): advantages divide by the group reward std.
+                    False (Dr.GRPO): advantages are only mean-centered. The
+                    trainer computes advantages and reads this flag — the loss
+                    itself receives already-normalized advantages.
     """
 
     def __init__(
         self,
-        reward_fn,
-        tokenizer,
-        num_generations=4,
-        beta=0.04,
-        epsilon=0.2,
-        max_new_tokens=512,
-        temperature=1.0,
-        label_pad_token_id=-100,
+        beta: float = 0.04,
+        epsilon: float = 0.2,
+        loss_type: Literal["grpo", "dr_grpo"] = "grpo",
+        scale_rewards: bool = True,
     ):
-        self.reward_fn = reward_fn
-        self.tokenizer = tokenizer
-        self.num_generations = num_generations
+        if loss_type not in ("grpo", "dr_grpo"):
+            raise ValueError(f"loss_type must be 'grpo' or 'dr_grpo', got {loss_type!r}")
         self.beta = beta
         self.epsilon = epsilon
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.label_pad_token_id = label_pad_token_id
-        self._pad_token_id = 0
+        self.loss_type = loss_type
+        self.scale_rewards = scale_rewards
 
-    def __call__(self, model, batch, training=True):
-        if not training:
-            return self._eval_forward(model, batch)
-        return self._train_forward(model, batch)
+    def __call__(
+        self,
+        *,
+        logprobs: torch.Tensor,
+        old_logprobs: torch.Tensor,
+        ref_logprobs: Optional[torch.Tensor],
+        advantages: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> GRPOLossOutput:
+        # Importance ratio between the current and the sampling (old) policy.
+        # When num_iterations == 1 the trainer passes old == logprobs.detach(),
+        # so ratio is exactly 1 and the clip is a no-op.
+        ratio = torch.exp(logprobs - old_logprobs)  # (N, T)
+        adv = advantages.unsqueeze(1)  # (N, 1)
 
-    def create_collator(self, pad_token_id):
-        self._pad_token_id = pad_token_id
-        return GRPOCollator(pad_token_id=pad_token_id)
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * adv
+        per_token_loss = -torch.min(unclipped, clipped)  # (N, T)
 
-    def _train_forward(self, model, batch):
-        input_ids = batch["input_ids"]  # [B, prompt_len]
-        attention_mask = batch["attention_mask"]  # [B, prompt_len]
-        B = input_ids.size(0)
-        G = self.num_generations
+        per_token_kl = None
+        if self.beta != 0.0 and ref_logprobs is not None:
+            # k3 estimator: unbiased and non-negative (Schulman).
+            diff = ref_logprobs - logprobs
+            per_token_kl = torch.exp(diff) - diff - 1.0
+            per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        # 1. Generate G completions per prompt (no grad)
-        repeated_ids = input_ids.repeat_interleave(G, dim=0)  # [B*G, prompt_len]
-        repeated_mask = attention_mask.repeat_interleave(G, dim=0)  # [B*G, prompt_len]
+        mask = completion_mask.to(per_token_loss.dtype)
 
-        with _disable_grad_checkpointing(model), torch.no_grad():
-            model.eval()
-            generated = model.generate(
-                input_ids=repeated_ids,
-                attention_mask=repeated_mask,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=True,
-                pad_token_id=self._pad_token_id,
-            )  # [B*G, prompt_len + completion_len]
-            model.train()
+        if self.loss_type == "grpo":
+            # Per-sequence length normalization, then average over sequences.
+            seq_loss = (per_token_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+            loss = seq_loss.mean()
+        else:  # dr_grpo — divide by a constant (the padded completion width)
+            loss = (per_token_loss * mask).sum() / (mask.size(0) * mask.size(1))
 
-        # Build labels: mask prompt tokens with label_pad_token_id
-        prompt_len = input_ids.size(1)
-        gen_labels = generated.clone()
-        gen_labels[:, :prompt_len] = self.label_pad_token_id
+        # Detached metrics over completion tokens only.
+        with torch.no_grad():
+            tok = mask.sum().clamp(min=1.0)
+            ratio_mean = ((ratio * mask).sum() / tok).item()
+            is_clipped = (
+                ((ratio < 1 - self.epsilon) & (adv < 0))
+                | ((ratio > 1 + self.epsilon) & (adv > 0))
+            ).to(mask.dtype)
+            clip_frac = ((is_clipped * mask).sum() / tok).item()
+            kl = (
+                ((per_token_kl * mask).sum() / tok).item()
+                if per_token_kl is not None
+                else 0.0
+            )
 
-        # Build attention mask for generated sequences
-        gen_attention_mask = (generated != self._pad_token_id).long()
-
-        # 2. Score completions with reward function
-        # Decode prompts and completions for reward_fn
-        prompt_texts = self.tokenizer.batch_decode(
-            repeated_ids, skip_special_tokens=True,
-        )
-        completion_texts = self.tokenizer.batch_decode(
-            generated[:, prompt_len:], skip_special_tokens=True,
-        )
-        del repeated_ids, repeated_mask  # Free [B*G, prompt_len] tensors
-
-        rewards = self.reward_fn(prompt_texts, completion_texts)  # list[float] or tensor
-        del prompt_texts, completion_texts  # Free decoded strings
-        if not isinstance(rewards, torch.Tensor):
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=input_ids.device)
-        elif rewards.device != input_ids.device:
-            rewards = rewards.to(input_ids.device)  # [B*G]
-
-        # 3. Group-relative advantages
-        rewards_grouped = rewards.view(B, G)
-        group_mean = rewards_grouped.mean(dim=1, keepdim=True)
-        group_std = rewards_grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
-        advantages = ((rewards_grouped - group_mean) / group_std).view(B * G)  # [B*G]
-        del rewards_grouped, group_mean, group_std
-
-        # Capture sequence length before tensors are freed
-        completion_length = gen_labels.size(1) - prompt_len
-
-        # 4. Old log-probs (from generation policy, no grad)
-        with _disable_grad_checkpointing(model), torch.no_grad():
-            old_logits = model(
-                input_ids=generated,
-                attention_mask=gen_attention_mask,
-                use_cache=False,
-            ).logits
-            old_logps = get_batch_logps(old_logits, gen_labels, self.label_pad_token_id)  # [B*G]
-            del old_logits
-
-        # 5. Policy log-probs (WITH grad)
-        logits = model(
-            input_ids=generated,
-            attention_mask=gen_attention_mask,
-            use_cache=False,
-        ).logits
-        del generated, gen_attention_mask  # Free [B*G, seq_len] tensors
-        logps = get_batch_logps(logits, gen_labels, self.label_pad_token_id)  # [B*G]
-        del logits, gen_labels
-
-        # 6. Clipped REINFORCE loss
-        ratio = torch.exp(logps - old_logps.detach())
-        clipped = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
-        # Use per-token style: advantages select which bound matters
-        policy_loss = -torch.mean(
-            torch.min(ratio * advantages.detach(), clipped * advantages.detach())
-        )
-
-        # 7. KL penalty (against old/generation policy)
-        kl = (old_logps.detach() - logps).mean()
-
-        loss = policy_loss
-        if self.beta > 0:
-            loss = loss + self.beta * kl
-
-        metrics = {
-            "rewards_mean": rewards.mean().item(),
-            "rewards_std": rewards.std().item(),
-            "advantages_mean": advantages.mean().item(),
-            "kl": kl.detach().item(),
-            "policy_loss": policy_loss.detach().item(),
-            "ratio_mean": ratio.detach().mean().item(),
-            "completion_length": completion_length,
-        }
-
-        return loss, metrics
-
-    def _eval_forward(self, model, batch):
-        """Eval not meaningful for GRPO (no labels). Return zero loss."""
-        loss = torch.tensor(0.0, device=batch["input_ids"].device)
-        return loss, {}
+        return GRPOLossOutput(loss=loss, kl=kl, clip_frac=clip_frac, ratio_mean=ratio_mean)

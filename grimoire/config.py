@@ -57,3 +57,33 @@ class TrainingConfig:
 
     # Reproducibility
     seed: int = 42
+
+
+@dataclass
+class GRPOConfig(TrainingConfig):
+    """Config for GRPOTrainer — adds online rollout / RL knobs to TrainingConfig.
+
+    Inherits every TrainingConfig field (output_dir, batch_size, learning_rate,
+    optimizer, checkpointing, logging, ...). ``batch_size`` is the number of
+    prompts per rollout step; each prompt is expanded into ``num_generations``
+    completions.
+
+    Note: loss-shaping knobs (beta / epsilon / loss_type / scale_rewards) live on
+    GRPOLoss, not here — the trainer reads ``loss_fn.scale_rewards`` /
+    ``loss_fn.loss_type`` when computing advantages.
+    """
+
+    # Rollout
+    num_generations: int = 8  # G — completions sampled per prompt
+    generation_batch_size: Optional[int] = None  # prompts per rollout; defaults to batch_size
+    max_completion_length: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: Optional[int] = None
+
+    # Optimization
+    num_iterations: int = 1  # PPO inner epochs (mu); 1 => old policy == sampling policy
+
+    # Generation backend
+    use_vllm: bool = False  # if True, generate via in-process vLLM; else HF .generate()
+    vllm_gpu_memory_utilization: float = 0.3
