@@ -1,5 +1,7 @@
 import torch
 
+from .common import encode_prompt_response
+
 
 class PreferenceCollator:
     """Pads chosen/rejected preference pairs to the max length in each batch."""
@@ -56,6 +58,11 @@ def tokenize_preference(
 ):
     """Tokenize a single example for preference training (ORPO/DPO).
 
+    Args:
+        max_length: Maximum total sequence length (prompt + response).
+        max_prompt_length: Maximum prompt length in tokens. Longer prompts are
+            truncated so more of the response is preserved for training.
+
     Use with dataset.map():
         dataset = dataset.map(
             lambda x: tokenize_preference(x, tokenizer, max_length=2048),
@@ -63,29 +70,21 @@ def tokenize_preference(
         )
     """
     prompt = example[prompt_field]
-    chosen = example[chosen_field]
-    rejected = example[rejected_field]
 
-    prompt_tokens = tokenizer(prompt, add_special_tokens=False)
-    prompt_len = len(prompt_tokens["input_ids"])
-    if max_prompt_length:
-        prompt_len = min(prompt_len, max_prompt_length)
-
-    chosen_tokens = tokenizer(prompt + chosen, max_length=max_length, truncation=True)
-    chosen_labels = list(chosen_tokens["input_ids"])
-    mask_len = min(prompt_len, len(chosen_labels))
-    chosen_labels[:mask_len] = [-100] * mask_len
-
-    rejected_tokens = tokenizer(prompt + rejected, max_length=max_length, truncation=True)
-    rejected_labels = list(rejected_tokens["input_ids"])
-    mask_len = min(prompt_len, len(rejected_labels))
-    rejected_labels[:mask_len] = [-100] * mask_len
+    chosen = encode_prompt_response(
+        tokenizer, prompt, example[chosen_field],
+        max_length=max_length, max_prompt_length=max_prompt_length,
+    )
+    rejected = encode_prompt_response(
+        tokenizer, prompt, example[rejected_field],
+        max_length=max_length, max_prompt_length=max_prompt_length,
+    )
 
     return {
-        "chosen_input_ids": chosen_tokens["input_ids"],
-        "chosen_attention_mask": chosen_tokens["attention_mask"],
-        "chosen_labels": chosen_labels,
-        "rejected_input_ids": rejected_tokens["input_ids"],
-        "rejected_attention_mask": rejected_tokens["attention_mask"],
-        "rejected_labels": rejected_labels,
+        "chosen_input_ids": chosen["input_ids"],
+        "chosen_attention_mask": chosen["attention_mask"],
+        "chosen_labels": chosen["labels"],
+        "rejected_input_ids": rejected["input_ids"],
+        "rejected_attention_mask": rejected["attention_mask"],
+        "rejected_labels": rejected["labels"],
     }

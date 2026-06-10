@@ -7,8 +7,9 @@ from .utils import _per_token_logps
 class SFTLoss:
     """Standard supervised fine-tuning loss (next-token prediction).
 
-    Uses row-by-row log-prob computation (same as preference training paths)
-    to avoid allocating a .contiguous() copy of the full logits tensor.
+    Uses the shared vectorized log-prob computation (same as the preference
+    training paths) to avoid allocating a .contiguous() copy of the full
+    logits tensor.
     Prompt tokens masked with -100 in labels are excluded from loss.
     """
 

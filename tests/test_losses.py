@@ -1086,6 +1086,51 @@ class TestGRPOLoss:
         # ratio = exp(logps - old_logps), should be ~1 since same model
         assert abs(metrics["ratio_mean"] - 1.0) < 0.1
 
+    def test_kl_with_ref_model(self):
+        """KL (k3 estimator) against a different reference model is non-negative."""
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss()
+        ref_model = GenerativeModel()
+        ref_model.eval()
+        loss_fn.ref_model = ref_model
+        batch = _make_grpo_batch()
+
+        loss, metrics = loss_fn(model, batch, training=True)
+
+        assert metrics["kl"] >= 0.0
+        assert not torch.isnan(loss)
+
+    def test_no_ref_model_skips_kl(self):
+        """With beta > 0 but no reference policy, the KL term is skipped."""
+        torch.manual_seed(42)
+        model, loss_fn = self._make_loss(beta=0.04)
+        batch = _make_grpo_batch()
+
+        _, metrics = loss_fn(model, batch, training=True)
+
+        assert metrics["kl"] == 0.0
+
+    def test_ref_model_must_be_eval(self):
+        with pytest.raises(ValueError):
+            GRPOLoss(
+                reward_fn=_constant_reward_fn,
+                tokenizer=MockTokenizer(),
+                ref_model=GenerativeModel(),  # still in training mode
+            )
+
+    def test_completion_mask_stops_after_eos(self):
+        """Tokens after the first EOS are masked out (generate() pads there)."""
+        _, loss_fn = self._make_loss()
+        loss_fn.tokenizer.eos_token_id = 7
+        completion_ids = torch.tensor([
+            [3, 7, 9, 9],  # EOS at index 1 → mask includes EOS, excludes rest
+            [3, 4, 5, 6],  # no EOS → all real
+        ])
+
+        mask = loss_fn._completion_mask(completion_ids)
+
+        assert mask.tolist() == [[1, 1, 0, 0], [1, 1, 1, 1]]
+
 
 def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):
     """Create a list-of-dicts preference dataset for caching tests."""

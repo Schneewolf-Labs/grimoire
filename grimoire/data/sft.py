@@ -1,5 +1,7 @@
 import torch
 
+from .common import encode_prompt_response
+
 
 class SFTCollator:
     """Pads SFT sequences to the max length in each batch."""
@@ -134,24 +136,12 @@ def tokenize_sft(
         }
 
     if prompt_field and response_field:
-        prompt = example[prompt_field]
-        response = example[response_field]
-
-        prompt_tokens = tokenizer(prompt, add_special_tokens=False)
-        prompt_len = len(prompt_tokens["input_ids"])
-        if max_prompt_length:
-            prompt_len = min(prompt_len, max_prompt_length)
-
-        tokens = tokenizer(prompt + response, max_length=max_length, truncation=True)
-
-        labels = list(tokens["input_ids"])
-        mask_len = min(prompt_len, len(labels))
-        labels[:mask_len] = [-100] * mask_len
-
-        return {
-            "input_ids": tokens["input_ids"],
-            "attention_mask": tokens["attention_mask"],
-            "labels": labels,
-        }
+        return encode_prompt_response(
+            tokenizer,
+            example[prompt_field],
+            example[response_field],
+            max_length=max_length,
+            max_prompt_length=max_prompt_length,
+        )
 
     raise ValueError("Provide either text_field or both prompt_field and response_field")

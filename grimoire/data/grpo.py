@@ -2,10 +2,14 @@ import torch
 
 
 class GRPOCollator:
-    """Pads prompt-only sequences for GRPO training.
+    """Left-pads prompt-only sequences for GRPO training.
 
     GRPO only needs prompts — completions are generated during training.
     Each example has input_ids and attention_mask (no labels).
+
+    Prompts are LEFT-padded: decoder-only generation requires the prompt to
+    end at the last position so completions directly continue it. With right
+    padding, the model would generate after a run of pad tokens.
     """
 
     def __init__(self, pad_token_id=0):
@@ -20,8 +24,8 @@ class GRPOCollator:
 
         for i, f in enumerate(features):
             seq_len = len(f["input_ids"])
-            input_ids[i, :seq_len] = torch.tensor(f["input_ids"], dtype=torch.long)
-            attention_mask[i, :seq_len] = torch.tensor(f["attention_mask"], dtype=torch.long)
+            input_ids[i, max_len - seq_len:] = torch.tensor(f["input_ids"], dtype=torch.long)
+            attention_mask[i, max_len - seq_len:] = torch.tensor(f["attention_mask"], dtype=torch.long)
 
         return {
             "input_ids": input_ids,
