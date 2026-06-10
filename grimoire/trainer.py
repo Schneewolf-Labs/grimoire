@@ -43,6 +43,11 @@ class Muon(torch.optim.Optimizer):
 
     Based on: https://github.com/KellerJordan/Muon
 
+    Note: the inner AdamW is stepped from within Muon.step() and is not
+    visible to accelerate or the LR scheduler — its learning rate stays
+    fixed for the whole run.  Its state IS included in state_dict() so
+    checkpoint resume preserves it.
+
     Args:
         params: Parameters for Muon (should be 2D+ tensors only).
         lr: Learning rate for Muon params (default: 0.02).
@@ -119,6 +124,21 @@ class Muon(torch.optim.Optimizer):
         super().zero_grad(set_to_none=set_to_none)
         if self.adam_optimizer is not None:
             self.adam_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        # Include the inner AdamW state — accelerate only sees this optimizer,
+        # so without this the AdamW momentum would be lost on checkpoint resume
+        state = super().state_dict()
+        if self.adam_optimizer is not None:
+            state["adam_optimizer"] = self.adam_optimizer.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        adam_state = state_dict.pop("adam_optimizer", None)
+        super().load_state_dict(state_dict)
+        if adam_state is not None and self.adam_optimizer is not None:
+            self.adam_optimizer.load_state_dict(adam_state)
 
 logger = logging.getLogger(__name__)
 
@@ -487,18 +507,26 @@ class GrimoireTrainer:
         # Optimizer
         optimizer = self._create_optimizer(model)
 
-        # LR scheduler
-        num_update_steps_per_epoch = math.ceil(
-            len(self.train_dataloader) / config.gradient_accumulation_steps
+        # LR scheduler — step counts here are computed from the UNSHARDED
+        # dataloader (num_processes x the per-process update count).  That is
+        # the unit AcceleratedScheduler expects: it steps the scheduler
+        # num_processes times per optimizer step, so the schedule still
+        # completes exactly at the end of training.
+        scheduler_total_steps = (
+            math.ceil(len(self.train_dataloader) / config.gradient_accumulation_steps)
+            * config.num_epochs
         )
-        self.max_steps = num_update_steps_per_epoch * config.num_epochs
 
-        warmup_steps = config.warmup_steps if config.warmup_steps > 0 else int(self.max_steps * config.warmup_ratio)
+        warmup_steps = (
+            config.warmup_steps
+            if config.warmup_steps > 0
+            else int(scheduler_total_steps * config.warmup_ratio)
+        )
         lr_scheduler = _create_scheduler(
             config.lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=self.max_steps,
+            num_training_steps=scheduler_total_steps,
         )
 
         # Prepare with accelerator (handles DDP, DeepSpeed, FSDP wrapping)
@@ -508,6 +536,16 @@ class GrimoireTrainer:
 
         if self.eval_dataloader is not None:
             self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
+
+        # Actual optimization steps this process will take — computed from the
+        # PREPARED (sharded) dataloader.  Under multi-GPU this is
+        # scheduler_total_steps / num_processes; using the pre-prepare count
+        # here would inflate the progress bar and train/progress by
+        # num_processes x.
+        num_update_steps_per_epoch = math.ceil(
+            len(self.train_dataloader) / config.gradient_accumulation_steps
+        )
+        self.max_steps = num_update_steps_per_epoch * config.num_epochs
 
         # Init experiment tracking
         if config.log_with:

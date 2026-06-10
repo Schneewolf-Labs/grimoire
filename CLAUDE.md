@@ -4,7 +4,7 @@ Simple, multi-GPU LLM fine-tuning library. Training engine for Merlina.
 
 ## Philosophy
 
-One training loop, pluggable loss functions. Adding a new training method means writing a loss function, not a new trainer. No CLI, no plugins, no unnecessary abstractions.
+One training loop, pluggable loss functions. Adding a new training method means writing a loss function, not a new trainer. A minimal YAML-driven CLI (`python -m grimoire.train`) for orchestrators like Merlina — no plugins, no unnecessary abstractions.
 
 ## Stack
 
@@ -20,6 +20,8 @@ grimoire/
 ├── config.py          # TrainingConfig dataclass
 ├── trainer.py         # GrimoireTrainer — the training loop
 ├── callbacks.py       # TrainerCallback base class
+├── registry.py        # String → class registry for the YAML CLI
+├── train.py           # CLI entry point (python -m grimoire.train --config run.yaml)
 ├── losses/
 │   ├── sft.py         # SFT loss (NLL on target tokens)
 │   ├── orpo.py        # ORPO loss (SFT + odds ratio)
@@ -31,6 +33,7 @@ grimoire/
 │   ├── grpo.py        # GRPO loss (group relative policy optimization)
 │   └── reward.py      # Reward model loss (Bradley-Terry pairwise ranking)
 └── data/
+    ├── common.py      # encode_prompt_response() — exact prompt masking
     ├── sft.py         # SFT collator + packed collator + tokenization
     ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
     ├── kto.py         # KTO collator + tokenization (unpaired feedback)
@@ -52,7 +55,7 @@ grimoire/
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
-- GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a clipped REINFORCE objective (requires ZeRO-2 or lower)
+- GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a REINFORCE objective with group-normalized advantages; one policy update per generation step (mu=1), so the importance ratio is 1 and clipping is inactive (kept for parity with the paper). Optional KL penalty (k3 estimator) against a frozen reference: `ref_model` if given, else the base model via `disable_adapter()` for PEFT. Prompts are LEFT-padded for generation. Requires ZeRO-2 or lower
 - RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
@@ -144,6 +147,8 @@ trainer = GrimoireTrainer(
         num_generations=4,
         beta=0.04,
         epsilon=0.2,
+        # ref_model=ref_model,  # frozen reference for the KL penalty;
+        # omit for PEFT models (base weights via disable_adapter())
     ),
     train_dataset=grpo_dataset,
 )
@@ -280,13 +285,15 @@ beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
 ```
 L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
 
-ratio         = pi(y|x) / pi_old(y|x)
+ratio         = pi(y|x) / pi_old(y|x)   (== 1: single update per generation step, mu=1)
 clipped_ratio = clamp(ratio, 1 - epsilon, 1 + epsilon)
 advantages    = (r - mean(r_group)) / std(r_group)  (normalized within group of G)
-KL            = mean(log_pi_old(y|x) - log_pi(y|x))
+KL            = mean(exp(d) - d - 1),  d = log_pi_ref(y|x) - log_pi(y|x)  (k3 estimator)
 
 pi         = policy model (being trained)
-pi_old     = generation policy (same model, frozen during this step)
+pi_old     = generation policy (same model, same weights — ratio kept for paper parity)
+pi_ref     = frozen reference: ref_model if given, else base model via disable_adapter();
+             if neither is available the KL term is skipped with a warning
 r          = reward scores from reward_fn
 G          = num_generations (completions per prompt)
 beta       = KL penalty (default 0.04)

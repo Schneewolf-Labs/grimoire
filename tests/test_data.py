@@ -194,6 +194,46 @@ class TestTokenizeSFT:
         with pytest.raises(ValueError):
             tokenize_sft({"text": "hello"}, mock_tokenizer)
 
+    def test_prompt_masking_with_bos_token(self):
+        """Prompt masking must account for special tokens added by the tokenizer."""
+        class BOSTokenizer:
+            bos_id = 1
+
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text]
+                if add_special_tokens:
+                    ids = [self.bos_id] + ids
+                if max_length:
+                    ids = ids[:max_length]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+        example = {"prompt": "AB", "response": "CD"}
+        result = tokenize_sft(example, BOSTokenizer(), prompt_field="prompt", response_field="response")
+
+        # BOS + both prompt tokens masked; previously the last prompt token
+        # leaked into the loss (off-by-one when the tokenizer prepends BOS)
+        assert result["input_ids"] == [1, ord("A"), ord("B"), ord("C"), ord("D")]
+        assert result["labels"] == [-100, -100, -100, ord("C"), ord("D")]
+
+    def test_prompt_trailing_eos_stripped(self):
+        """A tokenizer-appended EOS on the prompt must not split prompt and response."""
+        class EOSTokenizer:
+            eos_token_id = 2
+
+            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+                ids = [ord(c) for c in text]
+                if add_special_tokens:
+                    ids = ids + [self.eos_token_id]
+                if max_length:
+                    ids = ids[:max_length]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+        example = {"prompt": "AB", "response": "CD"}
+        result = tokenize_sft(example, EOSTokenizer(), prompt_field="prompt", response_field="response")
+
+        assert result["input_ids"] == [ord("A"), ord("B"), ord("C"), ord("D")]
+        assert result["labels"] == [-100, -100, ord("C"), ord("D")]
+
 
 class TestTokenizePreference:
     @pytest.fixture
@@ -365,9 +405,9 @@ class TestGRPOCollator:
         assert batch["input_ids"].shape == (2, 3)
         assert batch["attention_mask"].shape == (2, 3)
 
-        # Second sequence should be padded
-        assert batch["input_ids"][1].tolist() == [4, 5, 0]
-        assert batch["attention_mask"][1].tolist() == [1, 1, 0]
+        # Second sequence should be LEFT-padded (prompts feed generate())
+        assert batch["input_ids"][1].tolist() == [0, 4, 5]
+        assert batch["attention_mask"][1].tolist() == [0, 1, 1]
 
     def test_no_labels_in_output(self):
         """GRPO collator should not produce labels (prompt-only)."""
@@ -450,16 +490,16 @@ class TestTokenizePreferenceCustomFields:
         assert result["chosen_labels"][:2] == [-100, -100]
         assert result["rejected_labels"][:2] == [-100, -100]
 
-    def test_max_prompt_length_limits_masking(self, mock_tokenizer):
-        # prompt = "ABCD" (4 chars), max_prompt_length=2 → only 2 tokens masked
+    def test_max_prompt_length_truncates_prompt(self, mock_tokenizer):
+        # prompt = "ABCD" (4 chars), max_prompt_length=2 → prompt truncated to "AB"
         example = {"prompt": "ABCD", "chosen": "EF", "rejected": "GH"}
         result = tokenize_preference(
             example, mock_tokenizer, max_prompt_length=2
         )
 
-        # Only first 2 tokens should be masked (not all 4 prompt tokens)
+        assert result["chosen_input_ids"] == [ord("A"), ord("B"), ord("E"), ord("F")]
         assert result["chosen_labels"][:2] == [-100, -100]
-        assert result["chosen_labels"][2] != -100
+        assert result["chosen_labels"][2:] == [ord("E"), ord("F")]
 
     def test_truncates_to_max_length(self, mock_tokenizer):
         example = {"prompt": "AB", "chosen": "CDEFGHIJ", "rejected": "KLMNOPQR"}
