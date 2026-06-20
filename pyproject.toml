@@ -6,5 +6,10 @@ build-backend = "setuptools.build_meta"
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.lint.per-file-ignores]
+# Benchmark scripts adjust sys.path before importing common.py / unsloth,
+# which must precede transformers/trl imports.
+"benchmarks/**/*.py" = ["E402"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

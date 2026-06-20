@@ -1,0 +1,15 @@
+# Benchmark-only dependencies. Install in a fresh venv alongside grimoire:
+#   pip install -e . -r benchmarks/requirements.txt
+#
+# Pins are loose; these are the versions the scaffolding targets. Feel free
+# to re-lock for a specific run (record the resolved versions in your
+# results table so readers can reproduce).
+torch>=2.3
+transformers>=4.44
+accelerate>=0.33
+datasets>=2.20
+peft>=0.12
+trl>=0.11
+# Unsloth is installed separately per its docs — it is CUDA-version sensitive.
+# See https://github.com/unslothai/unsloth for the right pip URL for your setup.
+# unsloth @ git+https://github.com/unslothai/unsloth.git
