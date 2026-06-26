@@ -226,7 +226,9 @@ Available hooks: `on_train_begin`, `on_train_end`, `on_epoch_begin`, `on_epoch_e
 ```
 grimoire/
 ├── trainer.py         # GrimoireTrainer — the training loop
-├── config.py          # TrainingConfig dataclass
+├── grpo_trainer.py    # GRPOTrainer — online rollout/reward loop
+├── rewards.py         # RewardFn protocol
+├── config.py          # TrainingConfig + GRPOConfig dataclasses
 ├── callbacks.py       # TrainerCallback base class
 ├── losses/
 │   ├── sft.py         # SFT loss — NLL on target tokens
@@ -236,12 +238,12 @@ grimoire/
 │   ├── kto.py         # KTO loss — unpaired binary feedback
 │   ├── cpo.py         # CPO loss — reference-free + contrastive preference
 │   ├── ipo.py         # IPO loss — squared loss variant of DPO
-│   └── grpo.py        # GRPO loss — group relative policy optimization
+│   └── grpo.py        # GRPO loss — pure tensor-to-scalar loss
 └── data/
     ├── sft.py         # SFTCollator + tokenize_sft()
     ├── preference.py  # PreferenceCollator + tokenize_preference()
     ├── kto.py         # KTOCollator + tokenize_kto()
-    ├── grpo.py        # GRPOCollator + tokenize_grpo()
+    ├── grpo.py        # PromptCollator + tokenize_prompt()
     └── cache.py       # cache_reference_log_probs() — precompute ref logps
 ```
 

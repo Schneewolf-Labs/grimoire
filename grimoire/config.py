@@ -57,3 +57,27 @@ class TrainingConfig:
 
     # Reproducibility
     seed: int = 42
+
+
+@dataclass
+class GRPOConfig(TrainingConfig):
+    """Configuration for GRPOTrainer.
+
+    ``batch_size`` is the number of prompts per rollout step; each prompt is
+    expanded into ``num_generations`` sampled completions.
+    """
+
+    # Rollout
+    num_generations: int = 8
+    generation_batch_size: Optional[int] = None
+    max_completion_length: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: Optional[int] = None
+
+    # Optimization
+    num_iterations: int = 1
+
+    # Generation backend
+    use_vllm: bool = False
+    vllm_gpu_memory_utilization: float = 0.3

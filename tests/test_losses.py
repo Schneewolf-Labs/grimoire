@@ -14,7 +14,7 @@ from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
-from grimoire.losses.grpo import GRPOLoss
+from grimoire.losses.grpo import GRPOLoss, GRPOLossOutput
 from grimoire.losses.reward import RewardModelLoss
 from grimoire.data.cache import cache_reference_log_probs
 
@@ -910,226 +910,111 @@ class TestIPOLoss:
         assert "chosen_rewards" in metrics
 
 
-class GenerativeModel(nn.Module):
-    """Tiny model with generate() support for GRPO testing."""
-
-    def __init__(self, vocab_size=32, hidden_size=16):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, hidden_size)
-        self.head = nn.Linear(hidden_size, vocab_size)
-        self.vocab_size = vocab_size
-        self.config = type("Config", (), {"is_encoder_decoder": False})()
-
-    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False):
-        h = self.embed(input_ids)
-        logits = self.head(h)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = nn.functional.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        return type("Output", (), {"logits": logits, "loss": loss})()
-
-    def generate(self, input_ids, attention_mask=None, max_new_tokens=8,
-                 temperature=1.0, do_sample=True, pad_token_id=0):
-        """Simple autoregressive generation by sampling from logits."""
-        generated = input_ids
-        for _ in range(max_new_tokens):
-            logits = self.forward(generated).logits[:, -1, :]  # [B, vocab]
-            if temperature != 1.0:
-                logits = logits / temperature
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
-            generated = torch.cat([generated, next_token], dim=1)
-        return generated
-
-
-class MockTokenizer:
-    """Minimal tokenizer for GRPO testing."""
-
-    def batch_decode(self, token_ids, skip_special_tokens=True):
-        return [" ".join(str(t) for t in ids.tolist()) for ids in token_ids]
-
-
-def _make_grpo_batch(vocab_size=32, prompt_len=4, batch_size=2):
-    """Helper to create a GRPO prompt-only batch."""
-    return {
-        "input_ids": torch.randint(0, vocab_size, (batch_size, prompt_len)),
-        "attention_mask": torch.ones(batch_size, prompt_len, dtype=torch.long),
-    }
-
-
-def _constant_reward_fn(prompts, completions):
-    """Reward function that returns constant scores for testing."""
-    return [1.0] * len(prompts)
-
-
-def _length_reward_fn(prompts, completions):
-    """Reward function that scores by completion length (produces variance)."""
-    return [float(len(c)) for c in completions]
-
-
 class TestGRPOLoss:
-    def _make_loss(self, reward_fn=None, num_generations=2, beta=0.04, max_new_tokens=4):
-        model = GenerativeModel()
-        tokenizer = MockTokenizer()
-        if reward_fn is None:
-            reward_fn = _length_reward_fn
-        loss_fn = GRPOLoss(
-            reward_fn=reward_fn,
-            tokenizer=tokenizer,
-            num_generations=num_generations,
-            beta=beta,
-            max_new_tokens=max_new_tokens,
+    """GRPOLoss is now a PURE function of precomputed log-probs + advantages.
+
+    Rollout/generation lives in GRPOTrainer (see test_grpo_trainer.py); here we
+    only exercise the tensor math.
+    """
+
+    def _inputs(self, N=4, T=5, beta=0.04, seed=0, grad=True):
+        g = torch.Generator().manual_seed(seed)
+        logprobs = (torch.randn(N, T, generator=g) * 0.1).requires_grad_(grad)
+        old_logprobs = logprobs.detach().clone()
+        ref_logprobs = (torch.randn(N, T, generator=g) * 0.1) if beta > 0 else None
+        advantages = torch.randn(N, generator=g)
+        completion_mask = torch.ones(N, T)
+        return dict(
+            logprobs=logprobs,
+            old_logprobs=old_logprobs,
+            ref_logprobs=ref_logprobs,
+            advantages=advantages,
+            completion_mask=completion_mask,
         )
-        loss_fn._pad_token_id = 0
-        return model, loss_fn
 
-    def test_returns_scalar_loss_and_metrics(self):
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        loss, metrics = loss_fn(model, batch, training=True)
-
-        assert loss.dim() == 0
-        assert isinstance(metrics, dict)
-        assert "rewards_mean" in metrics
-        assert "rewards_std" in metrics
-        assert "advantages_mean" in metrics
-        assert "kl" in metrics
-        assert "policy_loss" in metrics
-        assert "ratio_mean" in metrics
-        assert "completion_length" in metrics
+    def test_returns_output_struct(self):
+        out = GRPOLoss(beta=0.04)(**self._inputs())
+        assert isinstance(out, GRPOLossOutput)
+        assert out.loss.dim() == 0
+        assert isinstance(out.kl, float)
+        assert isinstance(out.clip_frac, float)
+        assert isinstance(out.ratio_mean, float)
 
     def test_loss_is_finite(self):
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
+        out = GRPOLoss()(**self._inputs())
+        assert torch.isfinite(out.loss)
 
-        loss, _ = loss_fn(model, batch, training=True)
+    def test_ratio_one_when_old_equals_current(self):
+        out = GRPOLoss(beta=0.0)(**self._inputs(beta=0.0))
+        assert abs(out.ratio_mean - 1.0) < 1e-5
+        # ratio == 1 is inside the clip band, so nothing is clipped.
+        assert out.clip_frac == 0.0
 
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
+    def test_beta_zero_zeroes_kl(self):
+        out = GRPOLoss(beta=0.0)(**self._inputs(beta=0.0))
+        assert out.kl == 0.0
 
-    def test_eval_returns_zero_loss(self):
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
+    def test_beta_zero_accepts_none_ref(self):
+        inp = self._inputs(beta=0.0)
+        inp["ref_logprobs"] = None
+        out = GRPOLoss(beta=0.0)(**inp)
+        assert torch.isfinite(out.loss)
 
-        loss, metrics = loss_fn(model, batch, training=False)
-        assert loss.item() == 0.0
-        assert isinstance(metrics, dict)
+    def test_kl_nonnegative_with_ref(self):
+        # The k3 estimator is non-negative by construction.
+        out = GRPOLoss(beta=0.1)(**self._inputs(beta=0.1))
+        assert out.kl >= -1e-6
 
-    def test_num_generations_affects_batch(self):
-        """More generations should still produce valid loss."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss(num_generations=4)
-        batch = _make_grpo_batch(batch_size=2)
+    def test_loss_requires_grad_and_backprops(self):
+        inp = self._inputs()
+        out = GRPOLoss()(**inp)
+        assert out.loss.requires_grad
+        out.loss.backward()
+        assert inp["logprobs"].grad is not None
 
-        loss, metrics = loss_fn(model, batch, training=True)
+    def test_masked_tokens_do_not_affect_loss(self):
+        torch.manual_seed(0)
+        N, T = 3, 4
+        logprobs = torch.randn(N, T) * 0.1
+        old = logprobs.clone()
+        adv = torch.randn(N)
+        mask = torch.ones(N, T)
+        mask[:, -1] = 0  # last token is padding
+        base = dict(old_logprobs=old, ref_logprobs=None, advantages=adv, completion_mask=mask)
 
-        assert loss.dim() == 0
-        assert not torch.isnan(loss)
+        clean = GRPOLoss(beta=0.0)(logprobs=logprobs.clone(), **base).loss
+        poisoned_lp = logprobs.clone()
+        poisoned_lp[:, -1] += 5.0  # garbage at the masked position (kept finite)
+        poisoned = GRPOLoss(beta=0.0)(logprobs=poisoned_lp, **base).loss
 
-    def test_beta_zero_removes_kl(self):
-        """With beta=0, KL penalty should not contribute to loss."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss(beta=0.0)
-        batch = _make_grpo_batch()
+        assert torch.isclose(clean, poisoned, atol=1e-5)
 
-        loss, metrics = loss_fn(model, batch, training=True)
+    def test_dr_grpo_differs_from_grpo_with_varying_lengths(self):
+        inp = self._inputs(beta=0.0, N=2, T=4)
+        inp["completion_mask"] = torch.tensor([[1.0, 1, 1, 1], [1, 1, 0, 0]])
+        grpo = GRPOLoss(beta=0.0, loss_type="grpo")(**inp).loss
+        dr = GRPOLoss(beta=0.0, loss_type="dr_grpo")(**inp).loss
+        # grpo length-normalizes per sequence; dr_grpo uses a constant divisor.
+        assert not torch.isclose(grpo, dr)
 
-        assert loss.dim() == 0
-        assert not torch.isnan(loss)
+    def test_clip_active_when_ratio_deviates(self):
+        N, T = 4, 3
+        logprobs = torch.zeros(N, T)
+        old = torch.full((N, T), -1.0)  # ratio = exp(1) ~ 2.7, well outside [0.8, 1.2]
+        adv = torch.tensor([1.0, 1.0, -1.0, -1.0])
+        mask = torch.ones(N, T)
+        out = GRPOLoss(beta=0.0, epsilon=0.2)(
+            logprobs=logprobs,
+            old_logprobs=old,
+            ref_logprobs=None,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        assert out.clip_frac > 0.0
 
-    def test_constant_rewards_zero_advantages(self):
-        """When all rewards are identical, advantages should be zero."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss(reward_fn=_constant_reward_fn)
-        batch = _make_grpo_batch()
-
-        _, metrics = loss_fn(model, batch, training=True)
-
-        # With constant rewards, std is 0 but clamped, so advantages ~ 0
-        assert abs(metrics["advantages_mean"]) < 1e-6
-
-    def test_creates_correct_collator(self):
-        _, loss_fn = self._make_loss()
-        from grimoire.data.grpo import GRPOCollator
-        collator = loss_fn.create_collator(pad_token_id=0)
-        assert isinstance(collator, GRPOCollator)
-
-    def test_loss_requires_grad(self):
-        """Loss should have gradients flowing through policy log-probs."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        loss, _ = loss_fn(model, batch, training=True)
-
-        assert loss.requires_grad
-
-    def test_ratio_starts_near_one(self):
-        """On first call, old and new policy are the same, so ratio ~ 1."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        _, metrics = loss_fn(model, batch, training=True)
-
-        # ratio = exp(logps - old_logps), should be ~1 since same model
-        assert abs(metrics["ratio_mean"] - 1.0) < 0.1
-
-    def test_kl_with_ref_model(self):
-        """KL (k3 estimator) against a different reference model is non-negative."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        ref_model = GenerativeModel()
-        ref_model.eval()
-        loss_fn.ref_model = ref_model
-        batch = _make_grpo_batch()
-
-        loss, metrics = loss_fn(model, batch, training=True)
-
-        assert metrics["kl"] >= 0.0
-        assert not torch.isnan(loss)
-
-    def test_no_ref_model_skips_kl(self):
-        """With beta > 0 but no reference policy, the KL term is skipped."""
-        torch.manual_seed(42)
-        model, loss_fn = self._make_loss(beta=0.04)
-        batch = _make_grpo_batch()
-
-        _, metrics = loss_fn(model, batch, training=True)
-
-        assert metrics["kl"] == 0.0
-
-    def test_ref_model_must_be_eval(self):
+    def test_invalid_loss_type_raises(self):
         with pytest.raises(ValueError):
-            GRPOLoss(
-                reward_fn=_constant_reward_fn,
-                tokenizer=MockTokenizer(),
-                ref_model=GenerativeModel(),  # still in training mode
-            )
-
-    def test_completion_mask_stops_after_eos(self):
-        """Tokens after the first EOS are masked out (generate() pads there)."""
-        _, loss_fn = self._make_loss()
-        loss_fn.tokenizer.eos_token_id = 7
-        completion_ids = torch.tensor([
-            [3, 7, 9, 9],  # EOS at index 1 → mask includes EOS, excludes rest
-            [3, 4, 5, 6],  # no EOS → all real
-        ])
-
-        mask = loss_fn._completion_mask(completion_ids)
-
-        assert mask.tolist() == [[1, 1, 0, 0], [1, 1, 1, 1]]
+            GRPOLoss(loss_type="ppo")
 
 
 def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):
