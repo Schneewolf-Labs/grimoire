@@ -289,7 +289,14 @@ The dominant memory cost of preference training is the `[batch, seq, vocab]` log
 2. Per-token log-probs are computed from the final hidden states through the `lm_head` in chunks (`fused_chunk_size` tokens at a time, default 1024), under activation checkpointing so the backward pass recomputes each chunk instead of storing it.
 3. Only response tokens (unmasked labels) are pushed through the `lm_head` — prompt and padding positions never get logits at all.
 
-Peak logits memory drops from `batch * seq * vocab` to `chunk_size * vocab`, which typically lets you double or triple the preference-training batch size. The numerics are identical to the full-logits path (same log-softmax, same averaging), and post-head transforms declared by the model config (Gemma softcapping, Cohere `logit_scale`, Granite `logits_scaling`) are replayed. Models that don't support `logits_to_keep` (or don't expose `get_output_embeddings()`) silently fall back to the standard path — pass `fused=False` to any loss to force the fallback.
+Peak logits memory drops from `batch * seq * vocab` to `chunk_size * vocab`, which typically lets you double or triple the preference-training batch size. The numerics match the full-logits path (same log-softmax, same averaging, same dtype — the head chunks run under autocast when hidden states are half-precision), and post-head transforms declared by the model config (Gemma softcapping, Cohere `logit_scale`, Granite `logits_scaling`) are replayed.
+
+The fused path guards itself two ways:
+
+- **First-batch self-check**: the trimmed forward already computes the model's own logits for the final position; the fused path replays its `lm_head` + transform on the same hidden states and compares. A mismatch (e.g. an architecture with an undeclared post-head transform) logs a warning and permanently falls back to the full-logits path for that model — the fused path can be slow to engage, but never silently wrong.
+- **Automatic fallback**: models that don't support `logits_to_keep` (or don't expose `get_output_embeddings()`), and models with sharded parameters (FSDP, DeepSpeed ZeRO-3 — where the `lm_head` can't be called outside the wrapped forward) silently use the standard path. Pass `fused=False` to any loss to force it.
+
+One caveat: the fused path needs `output_hidden_states=True`, which keeps every layer's hidden states alive for the duration of the forward. During training with gradient checkpointing this is free (they're the checkpoint inputs anyway), but in no-grad reference passes it pins `num_layers * batch * seq * hidden` where the old path peaked at the logits tensor. Big-vocab models (Qwen, Llama-3) still come out ahead; small-vocab deep models (e.g. 32k-vocab Mistral) may not — `cache_reference_log_probs()` remains the cheapest way to handle reference passes either way.
 
 ## Adding a new training method
 

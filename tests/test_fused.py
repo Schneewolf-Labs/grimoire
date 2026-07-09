@@ -246,9 +246,10 @@ class TestFusedCapability:
         }
         with torch.no_grad():
             SFTLoss(fused=True)(model, batch)
-        # forward computed 1 trimmed position per row (2 rows), lm_head chunks
-        # covered exactly the 8 response positions
-        assert sum(model.lm_head.call_rows) == 2 + 8
+        # forward computed 1 trimmed position per row (2 rows), the one-time
+        # parity self-check replayed the final position (2 rows), and lm_head
+        # chunks covered exactly the 8 response positions
+        assert sum(model.lm_head.call_rows) == 2 + 2 + 8
 
     def test_chunking_respects_chunk_size(self):
         torch.manual_seed(0)
@@ -260,7 +261,8 @@ class TestFusedCapability:
         }
         with torch.no_grad():
             SFTLoss(fused=True, fused_chunk_size=3)(model, batch)
-        chunk_rows = model.lm_head.call_rows[1:]  # first call is the trimmed forward
+        # first two calls: the trimmed forward and the one-time parity replay
+        chunk_rows = model.lm_head.call_rows[2:]
         assert all(rows <= 3 for rows in chunk_rows)
         assert sum(chunk_rows) == 2 * 9  # every shifted position, once
 
@@ -468,3 +470,136 @@ class TestFusedEdgeCases:
         dataset = cache_reference_log_probs(ref_model, dataset, collator, batch_size=2)
         assert 1 in ref_model.forward_calls
         assert isinstance(dataset[0]["ref_chosen_logps"], float)
+
+
+class TestFusedShardingGate:
+    """FSDP / DeepSpeed ZeRO-3 sharded parameters must disable the fused path —
+    a direct lm_head call outside the wrapped forward would see sharded or
+    empty weights."""
+
+    def test_deepspeed_zero3_param_disables_fused(self):
+        model = HFStyleModel()
+        model.lm_head.weight.ds_id = 0  # DeepSpeed tags partitioned params
+        assert _fused_logits_kwarg(model) is None
+
+    def test_fsdp_wrapper_disables_fused(self):
+        class FullyShardedDataParallel(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                return self.module(*args, **kwargs)
+
+        model = FullyShardedDataParallel(HFStyleModel())
+        assert _fused_logits_kwarg(model) is None
+
+    def test_dtensor_param_disables_fused(self):
+        class DTensor(nn.Parameter):
+            pass
+
+        model = HFStyleModel()
+        model.lm_head.weight = DTensor(model.lm_head.weight.data)
+        assert _fused_logits_kwarg(model) is None
+
+    def test_sharding_gate_still_trains(self):
+        """The gate falls back to the full-logits path, not an error."""
+        torch.manual_seed(0)
+        model = HFStyleModel()
+        model.lm_head.weight.ds_id = 0
+        batch = {
+            "input_ids": torch.randint(0, 32, (2, 10)),
+            "attention_mask": torch.ones(2, 10, dtype=torch.long),
+            "labels": torch.randint(0, 32, (2, 10)),
+        }
+        loss, _ = SFTLoss(fused=True)(model, batch)
+        assert model.forward_calls == [0]  # full-logits forward
+        assert not torch.isnan(loss)
+
+
+class LyingModel(HFStyleModel):
+    """Applies a post-head transform it does NOT declare in its config —
+    the parity self-check must catch this and fall back."""
+
+    def _head(self, h, keep):
+        logits = super()._head(h, keep)
+        return torch.tanh(logits / 2.0) * 2.0
+
+
+class TestFusedParityCheck:
+    def test_undeclared_transform_falls_back(self, caplog):
+        torch.manual_seed(0)
+        model = LyingModel()
+        batch = {
+            "input_ids": torch.randint(0, 32, (2, 10)),
+            "attention_mask": torch.ones(2, 10, dtype=torch.long),
+            "labels": torch.randint(0, 32, (2, 10)),
+        }
+        import logging as _logging
+        with caplog.at_level(_logging.WARNING, logger="grimoire.losses.utils"):
+            loss_fused, _ = SFTLoss(fused=True)(model, batch)
+        assert any("self-check failed" in r.message for r in caplog.records)
+        # First call: trimmed forward, failed check, then a full fallback forward
+        assert model.forward_calls == [1, 0]
+
+        # The fallback result matches the plain full-logits path exactly
+        loss_unfused, _ = SFTLoss(fused=False)(model, batch)
+        assert torch.allclose(loss_fused.detach(), loss_unfused.detach())
+
+        # The model is permanently marked — no trimmed forwards afterwards
+        model.forward_calls.clear()
+        SFTLoss(fused=True)(model, batch)
+        assert model.forward_calls == [0]
+
+    def test_parity_check_runs_once(self):
+        torch.manual_seed(0)
+        model = HFStyleModel()
+        batch = {
+            "input_ids": torch.randint(0, 32, (2, 10)),
+            "attention_mask": torch.ones(2, 10, dtype=torch.long),
+            "labels": torch.randint(0, 32, (2, 10)),
+        }
+        with torch.no_grad():
+            SFTLoss(fused=True)(model, batch)
+            first_calls = len(model.lm_head.call_rows)
+            SFTLoss(fused=True)(model, batch)
+            second_calls = len(model.lm_head.call_rows) - first_calls
+        # Second call skips the parity replay: one fewer lm_head call
+        assert second_calls == first_calls - 1
+
+    def test_declared_softcap_passes_check(self):
+        """A declared transform is replayed, so the self-check passes and the
+        fused path stays engaged."""
+        torch.manual_seed(0)
+        model = HFStyleModel(final_logit_softcapping=1.5)
+        batch = {
+            "input_ids": torch.randint(0, 32, (2, 10)),
+            "attention_mask": torch.ones(2, 10, dtype=torch.long),
+            "labels": torch.randint(0, 32, (2, 10)),
+        }
+        SFTLoss(fused=True)(model, batch)
+        SFTLoss(fused=True)(model, batch)
+        assert model.forward_calls == [1, 1]  # trimmed both times, no fallback
+
+
+class TestFusedMixedPrecision:
+    def test_bf16_hidden_fp32_head_matches_fp32(self):
+        """Half-precision hidden states with an fp32 lm_head (mixed-precision
+        training with fp32 master weights) must run the head in the hidden
+        dtype — matching what the model's own autocast forward would produce."""
+        from grimoire.losses.utils import fused_per_token_logps
+
+        torch.manual_seed(0)
+        lm_head = nn.Linear(16, 32, bias=False)  # fp32 weights
+        hidden = torch.randn(2, 10, 16)
+        labels = torch.randint(0, 32, (2, 10))
+        labels[:, :3] = -100
+
+        ref_logps, ref_mask = fused_per_token_logps(hidden, lm_head, labels)
+        bf16_logps, bf16_mask = fused_per_token_logps(hidden.bfloat16(), lm_head, labels)
+
+        assert bf16_logps.dtype == torch.bfloat16  # head ran in bf16, not fp32
+        assert torch.equal(ref_mask, bf16_mask)
+        assert torch.allclose(
+            bf16_logps.float()[bf16_mask], ref_logps[ref_mask], rtol=5e-2, atol=5e-2
+        )
