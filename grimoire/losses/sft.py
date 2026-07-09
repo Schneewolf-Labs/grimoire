@@ -1,7 +1,5 @@
-import torch
-
 from ..data.sft import SFTCollator
-from .utils import _per_token_logps
+from .utils import DEFAULT_FUSED_CHUNK_SIZE, forward_per_token_logps
 
 
 class SFTLoss:
@@ -9,34 +7,28 @@ class SFTLoss:
 
     Uses the shared vectorized log-prob computation (same as the preference
     training paths) to avoid allocating a .contiguous() copy of the full
-    logits tensor.
+    logits tensor.  With ``fused=True`` (default) and a model that supports
+    it, the loss is computed chunk-by-chunk from the final hidden states
+    without materializing the [batch, seq, vocab] logits tensor at all.
     Prompt tokens masked with -100 in labels are excluded from loss.
     """
 
-    def __init__(self, label_pad_token_id=-100):
+    def __init__(self, label_pad_token_id=-100, fused=True, fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE):
         self.label_pad_token_id = label_pad_token_id
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
 
     def __call__(self, model, batch, training=True):
-        forward_kwargs = dict(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            use_cache=False,
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model,
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["labels"],
+            self.label_pad_token_id,
+            fused=self.fused,
+            fused_chunk_size=self.fused_chunk_size,
+            position_ids=batch.get("position_ids"),
         )
-        if "position_ids" in batch:
-            forward_kwargs["position_ids"] = batch["position_ids"]
-        logits = model(**forward_kwargs).logits
-        labels = batch["labels"]
-
-        shift_logits = logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-        del logits, labels
-
-        loss_mask = shift_labels != self.label_pad_token_id
-        vocab_size = shift_logits.size(-1)
-        safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
-
-        per_token_logps = _per_token_logps(shift_logits, safe_labels)
-        del shift_logits, safe_labels
 
         loss = -(per_token_logps * loss_mask).sum() / loss_mask.sum().clamp(min=1)
         return loss, {}

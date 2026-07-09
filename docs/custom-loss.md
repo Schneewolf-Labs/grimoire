@@ -250,6 +250,17 @@ trainer.train()
 
 3. **Reference models.** Store as `self.ref_model`, call with `torch.no_grad()`. The caller (not the trainer) manages the reference model lifecycle.
 
-4. **`_pad_dim1` helper.** Reuse from `grimoire.losses.orpo` to pad sequences to equal length before concatenation.
+4. **`pad_dim1` helper.** Reuse from `grimoire.losses.utils` to pad sequences to equal length before concatenation (or use `concatenate_preference` which does the whole chosen+rejected concat).
 
 5. **`use_cache=False`.** Always pass this in the forward call — caching is incompatible with gradient checkpointing.
+
+6. **Use `forward_per_token_logps` instead of a raw forward pass.** The walkthrough above materializes the full `[batch, seq, vocab]` logits tensor, which dominates memory on large-vocab models. The built-in losses instead call the shared helper, which runs the forward with `logits_to_keep=1` and computes log-probs chunk-by-chunk from the hidden states when the model supports it (falling back to full logits when it doesn't):
+
+   ```python
+   from grimoire.losses.utils import forward_per_token_logps, masked_avg_logps
+
+   per_token_logps, loss_mask = forward_per_token_logps(
+       model, input_ids, attention_mask, labels,
+   )
+   avg_logps = masked_avg_logps(per_token_logps, loss_mask)
+   ```

@@ -1,8 +1,12 @@
-import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import _per_token_logps, concatenate_preference
+from .utils import (
+    DEFAULT_FUSED_CHUNK_SIZE,
+    concatenate_preference,
+    forward_per_token_logps,
+    masked_avg_logps,
+)
 
 
 class CPOLoss:
@@ -21,10 +25,13 @@ class CPOLoss:
     a contrastive preference term (theoretically cleaner than ORPO's odds ratio).
     """
 
-    def __init__(self, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100):
+    def __init__(self, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100, fused=True,
+                 fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE):
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.label_pad_token_id = label_pad_token_id
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
         self._pad_token_id = 0
 
     def __call__(self, model, batch, training=True):
@@ -42,12 +49,20 @@ class CPOLoss:
         # Concatenate chosen + rejected for a single forward pass
         input_ids, attention_mask, labels = self._concatenate(batch)
 
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        del input_ids, attention_mask  # Free concatenated tensors
+        # Per-token log-probs — chunked from hidden states when fused, so the
+        # full [batch, seq, vocab] logits tensor is never materialized.
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model, input_ids, attention_mask, labels, self.label_pad_token_id,
+            fused=self.fused, fused_chunk_size=self.fused_chunk_size,
+        )
+        del input_ids, attention_mask, labels  # Free concatenated tensors
 
-        # Single-pass NLL + log-probability computation (avoids .contiguous() copy)
-        nll_loss, all_logps = self._compute_nll_and_logps(logits, labels, len_chosen)
-        del logits
+        # NLL on chosen response tokens — flat average matching F.cross_entropy
+        chosen_mask = loss_mask[:len_chosen]
+        nll_loss = -(per_token_logps[:len_chosen] * chosen_mask).sum() / chosen_mask.sum().clamp(min=1)
+
+        # Average log-probability per sequence
+        all_logps = masked_avg_logps(per_token_logps, loss_mask)
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
@@ -85,24 +100,3 @@ class CPOLoss:
     def _concatenate(self, batch):
         """Concatenate chosen and rejected into a single batch, padding to equal length."""
         return concatenate_preference(batch, self._pad_token_id, self.label_pad_token_id)
-
-    def _compute_nll_and_logps(self, logits, labels, len_chosen):
-        """Compute NLL loss and per-sequence average log-probs in one pass."""
-        shift_logits = logits[..., :-1, :]
-        shift_labels = labels[..., 1:]
-
-        loss_mask = shift_labels != self.label_pad_token_id
-        vocab_size = shift_logits.size(-1)
-        safe_labels = torch.where(loss_mask, shift_labels, 0).clamp(max=vocab_size - 1)
-
-        per_token_logps = _per_token_logps(shift_logits, safe_labels)
-        del shift_logits, safe_labels
-
-        # NLL on chosen response tokens — flat average matching F.cross_entropy
-        chosen_mask = loss_mask[:len_chosen]
-        chosen_nll = -(per_token_logps[:len_chosen] * chosen_mask).sum() / chosen_mask.sum().clamp(min=1)
-
-        # Average log-probability per sequence
-        avg_logps = (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1)
-
-        return chosen_nll, avg_logps

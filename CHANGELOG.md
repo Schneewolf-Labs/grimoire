@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- **Fused chunked linear+loss path** (`fused=True`, on by default in every logits-based loss: SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO). The model forward runs with `logits_to_keep=1` + `output_hidden_states=True`, and per-token log-probs are computed chunk-by-chunk from the final hidden states through the `lm_head` under activation checkpointing — the full `[batch, seq, vocab]` logits tensor is never materialized, in either the forward or backward pass. On large-vocab models (128k+) this tensor dominates preference-training memory (it's built for chosen+rejected in one pass and again for the reference model), so the fused path allows substantially larger batches. Only response tokens are pushed through the `lm_head`; prompt and padding positions never get logits at all. Reference-model passes and `cache_reference_log_probs()` use the same path. Models declaring post-head logit transforms (`final_logit_softcapping`, `logit_scale`, `logits_scaling`) have them replayed. Falls back silently to the full-logits path for models without `logits_to_keep`/`get_output_embeddings()` support — numerics are identical either way.
+- `forward_per_token_logps()`, `fused_per_token_logps()`, `per_token_logps_from_logits()`, and `masked_avg_logps()` helpers in `grimoire.losses.utils` for custom losses that want the same memory profile.
+
 ## [1.2.0] - 2026-05-20
 
 ### Added

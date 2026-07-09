@@ -60,6 +60,7 @@ grimoire/
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
 - Liger Kernel (`use_liger=True`) patches RMSNorm/RoPE/SwiGLU/GeGLU with fused Triton kernels for ~20% speedup and ~60% less activation VRAM; CE kernels stay disabled since losses are computed externally from logits; stacks with bitsandbytes 4-bit + LoRA for low-VRAM QLoRA training
+- Fused chunked linear+loss path (`fused=True`, default on for SFT/ORPO/DPO/SimPO/KTO/CPO/IPO/GRPO): the model forward runs with `logits_to_keep=1` so it never builds full logits, then per-token log-probs are computed chunk-by-chunk from final hidden states through the `lm_head` under activation checkpointing — the `[batch, seq, vocab]` logits tensor (the dominant memory cost of preference training on 128k+ vocab models) is never materialized in forward or backward. Only response tokens get logits; ref-model passes and `cache_reference_log_probs()` use the same path; post-head transforms (Gemma softcapping, Cohere `logit_scale`, Granite `logits_scaling`) are replayed; silently falls back to the full-logits path on models without `logits_to_keep` support with identical numerics
 
 ## Usage
 

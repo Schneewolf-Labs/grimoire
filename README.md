@@ -279,14 +279,17 @@ Implementation details:
 
 ### SFT loss
 
-Delegates entirely to the model's built-in cross-entropy:
+Standard next-token cross-entropy, computed with the same shared log-prob machinery as the preference losses. Prompt tokens are masked with `-100` in labels during tokenization, so they're automatically excluded from the loss.
 
-```python
-outputs = model(input_ids=..., attention_mask=..., labels=...)
-return outputs.loss, {}
-```
+### Fused linear loss (memory)
 
-Prompt tokens are masked with `-100` in labels during tokenization, so they're automatically excluded from the loss.
+The dominant memory cost of preference training is the `[batch, seq, vocab]` logits tensor — on a 128k-vocab model it dwarfs the activations, and it's built for chosen+rejected in one pass plus again for the reference model. All losses therefore default to a fused chunked path (`fused=True`):
+
+1. The model forward runs with `logits_to_keep=1`, so it never computes full logits.
+2. Per-token log-probs are computed from the final hidden states through the `lm_head` in chunks (`fused_chunk_size` tokens at a time, default 1024), under activation checkpointing so the backward pass recomputes each chunk instead of storing it.
+3. Only response tokens (unmasked labels) are pushed through the `lm_head` — prompt and padding positions never get logits at all.
+
+Peak logits memory drops from `batch * seq * vocab` to `chunk_size * vocab`, which typically lets you double or triple the preference-training batch size. The numerics are identical to the full-logits path (same log-softmax, same averaging), and post-head transforms declared by the model config (Gemma softcapping, Cohere `logit_scale`, Granite `logits_scaling`) are replayed. Models that don't support `logits_to_keep` (or don't expose `get_output_embeddings()`) silently fall back to the standard path — pass `fused=False` to any loss to force the fallback.
 
 ## Adding a new training method
 

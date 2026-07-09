@@ -9,7 +9,7 @@ the forward passes per step for DPO, KTO, and IPO.
 import torch
 from torch.utils.data import DataLoader
 
-from ..losses.utils import get_batch_logps as _get_batch_logps, _disable_grad_checkpointing
+from ..losses.utils import _disable_grad_checkpointing, forward_per_token_logps, masked_avg_logps
 
 
 def cache_reference_log_probs(
@@ -127,9 +127,15 @@ def cache_reference_log_probs(
 
 
 def _forward_logps(model, input_ids, attention_mask, labels, label_pad_token_id):
-    """Run a forward pass and return average log probs per sequence."""
-    logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-    return _get_batch_logps(logits, labels, label_pad_token_id)
+    """Run a forward pass and return average log probs per sequence.
+
+    Uses the chunked fused-linear path when the model supports it, so caching
+    never materializes the full [batch, seq, vocab] logits tensor.
+    """
+    per_token_logps, loss_mask = forward_per_token_logps(
+        model, input_ids, attention_mask, labels, label_pad_token_id,
+    )
+    return masked_avg_logps(per_token_logps, loss_mask)
 
 
 

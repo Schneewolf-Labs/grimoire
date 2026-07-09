@@ -2,7 +2,13 @@ import torch
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import get_batch_logps, concatenate_preference, _disable_grad_checkpointing
+from .utils import (
+    DEFAULT_FUSED_CHUNK_SIZE,
+    _disable_grad_checkpointing,
+    concatenate_preference,
+    forward_per_token_logps,
+    masked_avg_logps,
+)
 
 
 class DPOLoss:
@@ -17,13 +23,16 @@ class DPOLoss:
     that the policy is optimized against.
     """
 
-    def __init__(self, ref_model=None, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100):
+    def __init__(self, ref_model=None, beta=0.1, label_smoothing=0.0, label_pad_token_id=-100,
+                 fused=True, fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE):
         if ref_model is not None and ref_model.training:
             raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.label_pad_token_id = label_pad_token_id
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
         self._pad_token_id = 0
 
     def __call__(self, model, batch, training=True):
@@ -35,6 +44,13 @@ class DPOLoss:
         self._pad_token_id = pad_token_id
         return PreferenceCollator(pad_token_id=pad_token_id, label_pad_token_id=self.label_pad_token_id)
 
+    def _avg_logps(self, model, input_ids, attention_mask, labels):
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model, input_ids, attention_mask, labels, self.label_pad_token_id,
+            fused=self.fused, fused_chunk_size=self.fused_chunk_size,
+        )
+        return masked_avg_logps(per_token_logps, loss_mask)
+
     def _train_forward(self, model, batch):
         len_chosen = batch["chosen_input_ids"].size(0)
 
@@ -42,9 +58,7 @@ class DPOLoss:
         input_ids, attention_mask, labels = self._concatenate(batch)
 
         # Policy log-probs
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        all_logps = get_batch_logps(logits, labels, self.label_pad_token_id)
-        del logits
+        all_logps = self._avg_logps(model, input_ids, attention_mask, labels)
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
@@ -56,15 +70,13 @@ class DPOLoss:
         else:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                    ref_logps = self._avg_logps(self.ref_model, input_ids, attention_mask, labels)
                 elif hasattr(model, "disable_adapter"):
                     with _disable_grad_checkpointing(model), model.disable_adapter():
-                        ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                        ref_logps = self._avg_logps(model, input_ids, attention_mask, labels)
                 else:
                     raise ValueError("DPOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
-                del input_ids, attention_mask  # Free concatenated tensors
-                ref_logps = get_batch_logps(ref_logits, labels, self.label_pad_token_id)
-                del ref_logits, labels
+                del input_ids, attention_mask, labels  # Free concatenated tensors
                 ref_chosen_logps = ref_logps[:len_chosen]
                 ref_rejected_logps = ref_logps[len_chosen:]
 

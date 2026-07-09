@@ -3,7 +3,12 @@ import logging
 import torch
 
 from ..data.grpo import GRPOCollator
-from .utils import get_batch_logps, _disable_grad_checkpointing
+from .utils import (
+    DEFAULT_FUSED_CHUNK_SIZE,
+    _disable_grad_checkpointing,
+    forward_per_token_logps,
+    masked_avg_logps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,8 @@ class GRPOLoss:
         temperature=1.0,
         label_pad_token_id=-100,
         ref_model=None,
+        fused=True,
+        fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE,
     ):
         if ref_model is not None and ref_model.training:
             raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
@@ -60,8 +67,17 @@ class GRPOLoss:
         self.temperature = temperature
         self.label_pad_token_id = label_pad_token_id
         self.ref_model = ref_model
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
         self._pad_token_id = 0
         self._warned_no_ref = False
+
+    def _avg_logps(self, model, input_ids, attention_mask, labels):
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model, input_ids, attention_mask, labels, self.label_pad_token_id,
+            fused=self.fused, fused_chunk_size=self.fused_chunk_size,
+        )
+        return masked_avg_logps(per_token_logps, loss_mask)
 
     def __call__(self, model, batch, training=True):
         if not training:
@@ -137,13 +153,7 @@ class GRPOLoss:
         del rewards_grouped, group_mean, group_std
 
         # 4. Policy log-probs (WITH grad)
-        logits = model(
-            input_ids=generated,
-            attention_mask=gen_attention_mask,
-            use_cache=False,
-        ).logits
-        logps = get_batch_logps(logits, gen_labels, self.label_pad_token_id)  # [B*G]
-        del logits
+        logps = self._avg_logps(model, generated, gen_attention_mask, gen_labels)  # [B*G]
 
         # Generation policy log-probs: the model is only updated once per
         # generation step, so pi_old == pi — no extra forward pass needed.
@@ -205,14 +215,10 @@ class GRPOLoss:
         """Average log-probs under the frozen reference policy, or None if unavailable."""
         with torch.no_grad():
             if self.ref_model is not None:
-                ref_logits = self.ref_model(
-                    input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
-                ).logits
+                return self._avg_logps(self.ref_model, input_ids, attention_mask, labels)
             elif hasattr(model, "disable_adapter"):
                 with _disable_grad_checkpointing(model), model.disable_adapter():
-                    ref_logits = model(
-                        input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
-                    ).logits
+                    return self._avg_logps(model, input_ids, attention_mask, labels)
             else:
                 if not self._warned_no_ref:
                     logger.warning(
@@ -222,9 +228,6 @@ class GRPOLoss:
                     )
                     self._warned_no_ref = True
                 return None
-            ref_logps = get_batch_logps(ref_logits, labels, self.label_pad_token_id)
-            del ref_logits
-            return ref_logps
 
     def _eval_forward(self, model, batch):
         """Eval not meaningful for GRPO (no labels). Return zero loss."""
