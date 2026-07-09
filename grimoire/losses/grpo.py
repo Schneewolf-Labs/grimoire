@@ -107,6 +107,10 @@ class GRPOLoss:
                 temperature=self.temperature,
                 do_sample=True,
                 pad_token_id=self._pad_token_id,
+                # The trainer sets model.config.use_cache = False for training;
+                # be explicit here or generation may run cache-less — quadratic
+                # per-token recompute instead of incremental decoding.
+                use_cache=True,
             )  # [B*G, prompt_len + completion_len]
             model.train()
 
@@ -152,18 +156,20 @@ class GRPOLoss:
         advantages = ((rewards_grouped - group_mean) / group_std).view(B * G)  # [B*G]
         del rewards_grouped, group_mean, group_std
 
-        # 4. Policy log-probs (WITH grad)
+        # 4. Reference log-probs for the KL penalty (no grad).  The frozen
+        # pass runs BEFORE the policy forward so its activations never coexist
+        # with the policy's autograd graph — lower peak memory.
+        ref_logps = None
+        if self.beta > 0:
+            ref_logps = self._reference_logps(model, generated, gen_attention_mask, gen_labels)
+
+        # 5. Policy log-probs (WITH grad)
         logps = self._avg_logps(model, generated, gen_attention_mask, gen_labels)  # [B*G]
+        del generated, gen_attention_mask, gen_labels
 
         # Generation policy log-probs: the model is only updated once per
         # generation step, so pi_old == pi — no extra forward pass needed.
         old_logps = logps.detach()
-
-        # 5. Reference log-probs for the KL penalty (no grad)
-        ref_logps = None
-        if self.beta > 0:
-            ref_logps = self._reference_logps(model, generated, gen_attention_mask, gen_labels)
-        del generated, gen_attention_mask, gen_labels
 
         # 6. Clipped REINFORCE loss (ratio == 1, see class docstring)
         ratio = torch.exp(logps - old_logps)

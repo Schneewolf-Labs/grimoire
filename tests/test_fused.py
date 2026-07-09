@@ -131,7 +131,7 @@ class HFStyleGenerativeModel(HFStyleModel):
     """HF-style model with generate() support for GRPO testing."""
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=8,
-                 temperature=1.0, do_sample=True, pad_token_id=0):
+                 temperature=1.0, do_sample=True, pad_token_id=0, use_cache=None):
         generated = input_ids
         for _ in range(max_new_tokens):
             logits = self.forward(generated).logits[:, -1, :]

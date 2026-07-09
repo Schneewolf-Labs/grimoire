@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `forward_per_token_logps()`, `fused_per_token_logps()`, `per_token_logps_from_logits()`, and `masked_avg_logps()` helpers in `grimoire.losses.utils` for custom losses that want the same memory profile.
 - Fused-path guard rails: a first-batch parity self-check compares the replayed `lm_head` (+ declared post-head transform) against the model's own trimmed logits from the same forward and permanently falls back with a warning on mismatch, so an unknown architecture can be slower but never silently wrong; sharded-parameter setups (FSDP, DeepSpeed ZeRO-3, DTensor) are detected and use the full-logits path, since the `lm_head` cannot be called outside the wrapped forward; head chunks run under autocast when hidden states are half-precision and the head weights are fp32, matching mixed-precision numerics and tensor-core speed; the forward's retained per-layer hidden states are released before the chunked computation begins.
 
+### Changed
+- Reference-model losses (DPO, IPO, KTO, GRPO) now run the frozen reference forward BEFORE the policy forward. The reference pass carries no gradients, so computing it first means its activations never coexist with the policy's retained autograd graph — peak memory drops by roughly the reference pass's footprint. Loss values are unchanged (the two passes are independent).
+- GRPO passes `use_cache=True` explicitly to `model.generate()`. The trainer sets `model.config.use_cache = False` for training, and if generation ever inherited that, every new token would recompute the full prefix (quadratic decoding).
+
 ## [1.2.0] - 2026-05-20
 
 ### Added

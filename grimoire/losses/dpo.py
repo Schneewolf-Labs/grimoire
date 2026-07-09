@@ -57,16 +57,12 @@ class DPOLoss:
         # Concatenate chosen + rejected for a single forward pass
         input_ids, attention_mask, labels = self._concatenate(batch)
 
-        # Policy log-probs
-        all_logps = self._avg_logps(model, input_ids, attention_mask, labels)
-        chosen_logps = all_logps[:len_chosen]
-        rejected_logps = all_logps[len_chosen:]
-
-        # Reference log-probs: use cached values if available, else compute
+        # Reference log-probs: cached values, or a no-grad forward.  The
+        # frozen pass runs BEFORE the policy forward so its activations never
+        # coexist with the policy's autograd graph — lower peak memory.
         if "ref_chosen_logps" in batch:
-            del input_ids, attention_mask, labels  # Free concatenated tensors
-            ref_chosen_logps = batch["ref_chosen_logps"].to(chosen_logps.device)
-            ref_rejected_logps = batch["ref_rejected_logps"].to(chosen_logps.device)
+            ref_chosen_logps = batch["ref_chosen_logps"].to(input_ids.device)
+            ref_rejected_logps = batch["ref_rejected_logps"].to(input_ids.device)
         else:
             with torch.no_grad():
                 if self.ref_model is not None:
@@ -76,9 +72,14 @@ class DPOLoss:
                         ref_logps = self._avg_logps(model, input_ids, attention_mask, labels)
                 else:
                     raise ValueError("DPOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
-                del input_ids, attention_mask, labels  # Free concatenated tensors
-                ref_chosen_logps = ref_logps[:len_chosen]
-                ref_rejected_logps = ref_logps[len_chosen:]
+            ref_chosen_logps = ref_logps[:len_chosen]
+            ref_rejected_logps = ref_logps[len_chosen:]
+
+        # Policy log-probs
+        all_logps = self._avg_logps(model, input_ids, attention_mask, labels)
+        del input_ids, attention_mask, labels  # Free concatenated tensors
+        chosen_logps = all_logps[:len_chosen]
+        rejected_logps = all_logps[len_chosen:]
 
         # DPO loss: -log sigmoid(beta * (pi_logratio - ref_logratio))
         # With label smoothing: -(1-eps)*logsigmoid(x) - eps*logsigmoid(-x)

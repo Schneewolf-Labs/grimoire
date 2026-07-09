@@ -64,13 +64,11 @@ class KTOLoss:
         kto_label = batch["kto_label"]  # bool tensor: True=desirable, False=undesirable
         device = input_ids.device
 
-        # Policy log-probs
-        policy_logps = self._avg_logps(model, input_ids, attention_mask, labels)
-
-        # Reference log-probs: use cached values if available, else compute
+        # Reference log-probs: cached values, or a no-grad forward.  The
+        # frozen pass runs BEFORE the policy forward so its activations never
+        # coexist with the policy's autograd graph — lower peak memory.
         if "ref_logps" in batch:
-            del input_ids, attention_mask, labels  # Free batch tensors
-            ref_logps = batch["ref_logps"].to(policy_logps.device)
+            ref_logps = batch["ref_logps"].to(device)
         else:
             with torch.no_grad():
                 if self.ref_model is not None:
@@ -80,7 +78,10 @@ class KTOLoss:
                         ref_logps = self._avg_logps(model, input_ids, attention_mask, labels)
                 else:
                     raise ValueError("KTOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
-                del input_ids, attention_mask, labels  # Free batch tensors
+
+        # Policy log-probs
+        policy_logps = self._avg_logps(model, input_ids, attention_mask, labels)
+        del input_ids, attention_mask, labels  # Free batch tensors
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps
