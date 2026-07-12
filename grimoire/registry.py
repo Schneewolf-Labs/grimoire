@@ -19,7 +19,6 @@ LOSSES: dict[str, str] = {
     "kto":    "grimoire.losses.kto:KTOLoss",
     "cpo":    "grimoire.losses.cpo:CPOLoss",
     "ipo":    "grimoire.losses.ipo:IPOLoss",
-    "grpo":   "grimoire.losses.grpo:GRPOLoss",
     "reward": "grimoire.losses.reward:RewardModelLoss",
 }
 
@@ -28,7 +27,6 @@ TOKENIZERS: dict[str, str] = {
     "sft":        "grimoire.data.sft:tokenize_sft",
     "preference": "grimoire.data.preference:tokenize_preference",
     "kto":        "grimoire.data.kto:tokenize_kto",
-    "grpo":       "grimoire.data.grpo:tokenize_grpo",
 }
 
 

@@ -67,7 +67,7 @@ def get_batch_logps(logits, labels, label_pad_token_id=-100):
     """Average log probability per sequence over response tokens only.
 
     Shared by all loss functions that need per-sequence log probabilities
-    (ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, and the reference log prob cache).
+    (ORPO, DPO, SimPO, KTO, CPO, IPO, and the reference log prob cache).
     """
     shift_logits = logits[..., :-1, :]
     shift_labels = labels[..., 1:]

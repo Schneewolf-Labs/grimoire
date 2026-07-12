@@ -163,7 +163,7 @@ def load_dataset_from_spec(spec: dict):
 
 
 def tokenize_dataset(dataset, tokenizer, tokenize_spec: dict):
-    """Apply a tokenize function (sft/preference/kto/grpo) to the dataset."""
+    """Apply a tokenize function (sft/preference/kto) to the dataset."""
     from .registry import get_tokenize_fn
 
     kwargs = dict(tokenize_spec)

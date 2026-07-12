@@ -73,7 +73,7 @@ To enable automated PyPI publishing:
 | Change | Version bump | Example |
 |--------|-------------|---------|
 | Fix CUDA memory access bug | Patch | 0.1.0 → 0.1.1 |
-| Add new loss function (e.g., GRPO) | Minor | 0.1.0 → 0.2.0 |
+| Add new loss function (e.g., a new preference loss) | Minor | 0.1.0 → 0.2.0 |
 | Add new config option with default | Minor | 0.1.0 → 0.2.0 |
 | Rename `TrainingConfig` fields | Major | 0.1.0 → 1.0.0 |
 | Remove a loss function | Major | 0.1.0 → 1.0.0 |

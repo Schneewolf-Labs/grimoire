@@ -1,13 +1,12 @@
 # Choosing a Training Method
 
-Grimoire supports 8 training methods. This guide helps you pick the right one.
+Grimoire supports 7 offline fine-tuning methods. This guide helps you pick the right one. (Online RL — generating and scoring completions on the fly — lives in a separate library.)
 
 ## Start here: What data do you have?
 
 - **Prompt + completion examples** (no preference pairs) → [**SFT**](#sft)
 - **Thumbs-up / thumbs-down per response** (unpaired feedback) → [**KTO**](#kto)
 - **Chosen + rejected response pairs** → see [preference methods](#preference-methods) below
-- **Prompts + a reward function** (generate and score on-the-fly) → [**GRPO**](#grpo)
 
 ## SFT
 
@@ -235,55 +234,6 @@ desirable_loss   = lambda_d * (1 - sigmoid(beta * (log_ratio - KL_ref)))
 undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 ```
 
-## GRPO
-
-Group Relative Policy Optimization. Generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
-
-- **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
-- **Memory:** Very high (generation + two forward passes per batch)
-- **Key params:** `reward_fn` — callable `(prompts, completions) → list[float]`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
-- **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access
-
-```python
-import copy
-from grimoire.losses import GRPOLoss
-from grimoire.data import tokenize_grpo
-
-# Dataset needs only prompts — no responses required
-dataset = dataset.map(
-    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
-    remove_columns=dataset.column_names,
-)
-
-def reward_fn(prompts, completions):
-    # Return a score for each (prompt, completion) pair
-    return [score_completion(p, c) for p, c in zip(prompts, completions)]
-
-trainer = GrimoireTrainer(
-    model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
-        reward_fn=reward_fn,
-        tokenizer=tokenizer,
-        num_generations=4,
-        beta=0.04,
-        epsilon=0.2,
-        max_new_tokens=512,
-    ),
-    train_dataset=dataset,
-)
-trainer.train()
-```
-
-**Loss formula:**
-```
-L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
-
-ratio         = pi(y|x) / pi_old(y|x)
-clipped_ratio = clamp(ratio, 1-epsilon, 1+epsilon)
-advantages    = (r - mean(r_group)) / std(r_group)   # normalized within group of G
-KL            = mean(log_pi_old(y|x) - log_pi(y|x))
-```
-
 ## Quick Reference
 
 | Method | Data Format | Ref Model | Memory | Best For |
@@ -295,7 +245,6 @@ KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 | DPO | Paired | Yes | High | Standard preference alignment |
 | IPO | Paired | Yes | High | Noisy preference data |
 | KTO | Unpaired | Yes | High | Binary feedback (no pairs) |
-| GRPO | Prompts only | No | Very high | Verifiable reward signal (math, code) |
 
 ## Typical Training Pipelines
 
@@ -303,4 +252,3 @@ KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 2. **Base model → aligned in one step:** ORPO or CPO
 3. **SFT model → aligned:** DPO, SimPO, or IPO
 4. **SFT model → aligned from user feedback:** KTO
-5. **SFT model → aligned with a reward function:** GRPO

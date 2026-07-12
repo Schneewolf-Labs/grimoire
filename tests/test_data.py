@@ -4,7 +4,6 @@ import pytest
 from grimoire.data.sft import SFTCollator, PackedSFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
 from grimoire.data.kto import KTOCollator, tokenize_kto
-from grimoire.data.grpo import GRPOCollator, tokenize_grpo
 
 
 class TestSFTCollator:
@@ -391,52 +390,6 @@ class TestTokenizeKTO:
 
         assert tokenize_kto(desirable, mock_tokenizer)["kto_label"] is True
         assert tokenize_kto(undesirable, mock_tokenizer)["kto_label"] is False
-
-
-class TestGRPOCollator:
-    def test_pads_to_max_length(self):
-        collator = GRPOCollator(pad_token_id=0)
-        features = [
-            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
-            {"input_ids": [4, 5], "attention_mask": [1, 1]},
-        ]
-        batch = collator(features)
-
-        assert batch["input_ids"].shape == (2, 3)
-        assert batch["attention_mask"].shape == (2, 3)
-
-        # Second sequence should be LEFT-padded (prompts feed generate())
-        assert batch["input_ids"][1].tolist() == [0, 4, 5]
-        assert batch["attention_mask"][1].tolist() == [0, 1, 1]
-
-    def test_no_labels_in_output(self):
-        """GRPO collator should not produce labels (prompt-only)."""
-        collator = GRPOCollator(pad_token_id=0)
-        features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
-        batch = collator(features)
-
-        assert "labels" not in batch
-
-    def test_single_element_batch(self):
-        collator = GRPOCollator(pad_token_id=0)
-        features = [{"input_ids": [1, 2], "attention_mask": [1, 1]}]
-        batch = collator(features)
-
-        assert batch["input_ids"].shape == (1, 2)
-        assert batch["input_ids"][0].tolist() == [1, 2]
-
-    def test_equal_lengths_no_padding(self):
-        collator = GRPOCollator(pad_token_id=0)
-        features = [
-            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]},
-            {"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1]},
-        ]
-        batch = collator(features)
-
-        assert batch["input_ids"].shape == (2, 3)
-        assert (batch["attention_mask"] == 1).all()
-
-
 class TestTokenizeSFTTruncation:
     @pytest.fixture
     def mock_tokenizer(self):
@@ -545,40 +498,3 @@ class TestTokenizeKTOCustomFields:
         example2 = {"prompt": "A", "response": "B", "label": 0}
         result2 = tokenize_kto(example2, mock_tokenizer)
         assert result2["kto_label"] is False
-
-
-class TestTokenizeGRPO:
-    @pytest.fixture
-    def mock_tokenizer(self):
-        class MockTokenizer:
-            def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
-                ids = [ord(c) for c in text[:max_length]] if max_length else [ord(c) for c in text]
-                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
-        return MockTokenizer()
-
-    def test_produces_correct_keys(self, mock_tokenizer):
-        example = {"prompt": "hello"}
-        result = tokenize_grpo(example, mock_tokenizer)
-
-        assert "input_ids" in result
-        assert "attention_mask" in result
-        assert "labels" not in result
-
-    def test_tokenizes_prompt_only(self, mock_tokenizer):
-        example = {"prompt": "AB"}
-        result = tokenize_grpo(example, mock_tokenizer)
-
-        assert result["input_ids"] == [ord("A"), ord("B")]
-        assert result["attention_mask"] == [1, 1]
-
-    def test_respects_max_prompt_length(self, mock_tokenizer):
-        example = {"prompt": "ABCDEF"}
-        result = tokenize_grpo(example, mock_tokenizer, max_prompt_length=3)
-
-        assert len(result["input_ids"]) == 3
-
-    def test_custom_prompt_field(self, mock_tokenizer):
-        example = {"question": "AB"}
-        result = tokenize_grpo(example, mock_tokenizer, prompt_field="question")
-
-        assert result["input_ids"] == [ord("A"), ord("B")]

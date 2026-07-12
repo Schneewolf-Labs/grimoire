@@ -30,14 +30,12 @@ grimoire/
 │   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
 │   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
 │   ├── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
-│   ├── grpo.py        # GRPO loss (group relative policy optimization)
 │   └── reward.py      # Reward model loss (Bradley-Terry pairwise ranking)
 └── data/
     ├── common.py      # encode_prompt_response() — exact prompt masking
     ├── sft.py         # SFT collator + packed collator + tokenization
     ├── preference.py  # Preference collator + tokenization (ORPO/DPO/SimPO/CPO/IPO)
     ├── kto.py         # KTO collator + tokenization (unpaired feedback)
-    ├── grpo.py        # GRPO collator + tokenization (prompt-only)
     └── cache.py       # cache_reference_log_probs() utility
 ```
 
@@ -55,7 +53,6 @@ grimoire/
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
-- GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a REINFORCE objective with group-normalized advantages; one policy update per generation step (mu=1), so the importance ratio is 1 and clipping is inactive (kept for parity with the paper). Optional KL penalty (k3 estimator) against a frozen reference: `ref_model` if given, else the base model via `disable_adapter()` for PEFT. Prompts are LEFT-padded for generation. Requires ZeRO-2 or lower
 - RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
@@ -65,8 +62,8 @@ grimoire/
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss, RewardModelLoss
-from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_grpo, PackedSFTCollator
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, RewardModelLoss
+from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, PackedSFTCollator
 
 config = TrainingConfig(
     output_dir="./output",
@@ -131,26 +128,6 @@ ref_model.eval()
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
     loss_fn=IPOLoss(ref_model=ref_model, beta=0.1), train_dataset=pref_dataset,
-)
-trainer.train()
-
-# GRPO — online RL with a reward function (no pre-labeled data needed)
-grpo_dataset = dataset.map(
-    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
-    remove_columns=dataset.column_names,
-)
-trainer = GrimoireTrainer(
-    model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
-        reward_fn=my_reward_fn,  # callable: (prompts, completions) -> list[float]
-        tokenizer=tokenizer,
-        num_generations=4,
-        beta=0.04,
-        epsilon=0.2,
-        # ref_model=ref_model,  # frozen reference for the KL penalty;
-        # omit for PEFT models (base weights via disable_adapter())
-    ),
-    train_dataset=grpo_dataset,
 )
 trainer.train()
 
@@ -280,26 +257,6 @@ pi_ref     = reference model (frozen copy of initial weights)
 beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
 ```
 
-## GRPO Loss Formula
-
-```
-L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
-
-ratio         = pi(y|x) / pi_old(y|x)   (== 1: single update per generation step, mu=1)
-clipped_ratio = clamp(ratio, 1 - epsilon, 1 + epsilon)
-advantages    = (r - mean(r_group)) / std(r_group)  (normalized within group of G)
-KL            = mean(exp(d) - d - 1),  d = log_pi_ref(y|x) - log_pi(y|x)  (k3 estimator)
-
-pi         = policy model (being trained)
-pi_old     = generation policy (same model, same weights — ratio kept for paper parity)
-pi_ref     = frozen reference: ref_model if given, else base model via disable_adapter();
-             if neither is available the KL term is skipped with a warning
-r          = reward scores from reward_fn
-G          = num_generations (completions per prompt)
-beta       = KL penalty (default 0.04)
-epsilon    = clip ratio (default 0.2)
-```
-
 ## Reward Model Loss Formula
 
 ```
@@ -320,7 +277,7 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 
 Grimoire handles:
 - The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, Reward Model)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, Reward Model) — offline, static-dataset losses only; online RL (e.g. GRPO) lives in a separate library
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration

@@ -235,13 +235,11 @@ grimoire/
 │   ├── simpo.py       # SimPO loss — reference-free + reward margin
 │   ├── kto.py         # KTO loss — unpaired binary feedback
 │   ├── cpo.py         # CPO loss — reference-free + contrastive preference
-│   ├── ipo.py         # IPO loss — squared loss variant of DPO
-│   └── grpo.py        # GRPO loss — group relative policy optimization
+│   └── ipo.py         # IPO loss — squared loss variant of DPO
 └── data/
     ├── sft.py         # SFTCollator + tokenize_sft()
     ├── preference.py  # PreferenceCollator + tokenize_preference()
     ├── kto.py         # KTOCollator + tokenize_kto()
-    ├── grpo.py        # GRPOCollator + tokenize_grpo()
     └── cache.py       # cache_reference_log_probs() — precompute ref logps
 ```
 

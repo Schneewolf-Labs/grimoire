@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Removed
+- **GRPO** (`GRPOLoss`, `GRPOCollator`, `tokenize_grpo`, and the `grpo` loss/tokenizer registry entries). Online RL — generating completions and scoring them against a reward function or environment — is a fundamentally different concern from Grimoire's offline, static-dataset losses: it needs `model.generate()`, a reward callable, reference-model KL, and it constrains the distributed strategy (no ZeRO-3). It now lives in a dedicated RL library. **Breaking:** import GRPO from that library instead. The offline losses (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, Reward Model) are unaffected.
+
 ## [1.2.0] - 2026-05-20
 
 ### Added
