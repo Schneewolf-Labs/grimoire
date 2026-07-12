@@ -937,8 +937,9 @@ class GenerativeModel(nn.Module):
         return type("Output", (), {"logits": logits, "loss": loss})()
 
     def generate(self, input_ids, attention_mask=None, max_new_tokens=8,
-                 temperature=1.0, do_sample=True, pad_token_id=0):
+                 temperature=1.0, do_sample=True, pad_token_id=0, use_cache=None):
         """Simple autoregressive generation by sampling from logits."""
+        self.last_generate_use_cache = use_cache
         generated = input_ids
         for _ in range(max_new_tokens):
             logits = self.forward(generated).logits[:, -1, :]  # [B, vocab]
@@ -1494,3 +1495,84 @@ class TestRewardModelLoss:
         from grimoire.data.preference import PreferenceCollator
         collator = loss_fn.create_collator(pad_token_id=0)
         assert isinstance(collator, PreferenceCollator)
+
+
+class TestReferenceForwardOrdering:
+    """The frozen reference pass must run BEFORE the policy forward — running
+    it first keeps its activations from coexisting with the policy's autograd
+    graph, which lowers peak memory."""
+
+    @staticmethod
+    def _tag(model, name, calls):
+        model.register_forward_pre_hook(lambda module, args: calls.append(name))
+
+    def _assert_ref_first(self, loss_cls, batch, **kwargs):
+        calls = []
+        torch.manual_seed(0)
+        model = SimpleModel()
+        ref_model = SimpleModel()
+        ref_model.eval()
+        self._tag(model, "policy", calls)
+        self._tag(ref_model, "ref", calls)
+
+        loss_fn = loss_cls(ref_model=ref_model, **kwargs)
+        loss_fn._pad_token_id = 0
+        loss, _ = loss_fn(model, batch, training=True)
+
+        assert calls == ["ref", "policy"]
+        assert not torch.isnan(loss)
+
+    def test_dpo_ref_runs_first(self):
+        self._assert_ref_first(DPOLoss, _make_preference_batch(), beta=0.1)
+
+    def test_ipo_ref_runs_first(self):
+        self._assert_ref_first(IPOLoss, _make_preference_batch(), beta=0.1)
+
+    def test_kto_ref_runs_first(self):
+        self._assert_ref_first(KTOLoss, _make_kto_batch(), beta=0.1)
+
+    def test_grpo_ref_runs_before_policy_scoring(self):
+        calls = []
+        torch.manual_seed(0)
+        model = GenerativeModel()
+        ref_model = GenerativeModel()
+        ref_model.eval()
+        self._tag(model, "policy", calls)
+        self._tag(ref_model, "ref", calls)
+
+        loss_fn = GRPOLoss(
+            reward_fn=_length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=2,
+            beta=0.04,
+            max_new_tokens=4,
+            ref_model=ref_model,
+        )
+        loss_fn._pad_token_id = 0
+        loss, _ = loss_fn(model, _make_grpo_batch(), training=True)
+
+        # Generation produces a run of policy forwards; the scoring pass must
+        # be the single policy forward AFTER the reference pass.
+        assert "ref" in calls
+        assert calls.index("ref") == len(calls) - 2
+        assert calls[-1] == "policy"
+        assert not torch.isnan(loss)
+
+
+class TestGRPOGenerationCache:
+    def test_generate_uses_kv_cache(self):
+        """GRPOLoss must explicitly request use_cache=True: the trainer sets
+        model.config.use_cache = False for training, and cache-less generation
+        recomputes the whole prefix per token."""
+        torch.manual_seed(0)
+        model = GenerativeModel()
+        loss_fn = GRPOLoss(
+            reward_fn=_constant_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=2,
+            beta=0.0,
+            max_new_tokens=4,
+        )
+        loss_fn._pad_token_id = 0
+        loss_fn(model, _make_grpo_batch(), training=True)
+        assert model.last_generate_use_cache is True
