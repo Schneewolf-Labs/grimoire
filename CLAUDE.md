@@ -1,10 +1,12 @@
 # Grimoire
 
-Simple, multi-GPU LLM fine-tuning library. Training engine for Merlina.
+Simple, multi-GPU LLM fine-tuning library for **offline** losses. Training engine for Merlina.
 
 ## Philosophy
 
 One training loop, pluggable loss functions. Adding a new training method means writing a loss function, not a new trainer. A minimal YAML-driven CLI (`python -m grimoire.train`) for orchestrators like Merlina — no plugins, no unnecessary abstractions.
+
+**Scope: offline fine-tuning only.** Every loss is a pure function `loss, metrics = loss_fn(model, batch, training)` over a fixed, pre-tokenized dataset — SFT plus the preference and reward-model losses. Online RL (generating completions *during* training and scoring them against a reward function or environment — GRPO, PPO, RLOO, …) is deliberately **out of scope**. That kind of loss can't be pure: it needs `model.generate()` in the loop, a reward/environment interface, reference-model KL, and it constrains the distributed strategy (no ZeRO-3). Cramming it behind the `loss_fn` signature is what made GRPO the one abstraction-breaking outlier, so it was removed (see CHANGELOG) and now lives in a separate RL library that *imports* grimoire. Keeping generation and environments out is precisely what keeps the loss-function abstraction clean — don't reintroduce them here.
 
 ## Stack
 

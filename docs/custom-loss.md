@@ -2,6 +2,8 @@
 
 Adding a new training method to Grimoire means writing a loss class. The trainer, data loading, checkpointing, and multi-GPU support all stay the same.
 
+> **Offline losses only.** A loss here must be a pure function of `(model, batch)` over a fixed, pre-tokenized dataset. If your method needs to *generate* completions during training and score them against a reward function or environment (GRPO, PPO, RLOO, …), it does not belong in grimoire — that requires `model.generate()` in the loop, a reward/environment interface, and it constrains the distributed strategy (no ZeRO-3). Online RL lives in a separate library that builds on grimoire. See the CHANGELOG entry for the GRPO removal for the full rationale.
+
 ## The Interface
 
 Every loss function must implement two things:

@@ -1,6 +1,6 @@
 # 📖 Grimoire ✨
 
-A simple, multi-GPU LLM fine-tuning library. One training loop, pluggable loss functions.
+A simple, multi-GPU LLM fine-tuning library for **offline** losses. One training loop, pluggable loss functions.
 
 Built as the training engine behind [Merlina](https://github.com/Schneewolf-Labs/Merlina), replacing TRL's ORPO trainer after it was marked experimental.
 
@@ -8,7 +8,11 @@ Built as the training engine behind [Merlina](https://github.com/Schneewolf-Labs
 
 TRL's ORPO implementation is unstable — it lives in `trl.experimental` and can break between releases. But ORPO's math is simple: it's just SFT loss plus an odds ratio term. The training loop infrastructure (multi-GPU, checkpointing, gradient accumulation) is the hard part, and `accelerate` already handles it well.
 
-Grimoire is the result: ~400 lines of code that give you SFT and ORPO training with native multi-GPU support.
+Grimoire is the result: a small codebase that gives you SFT and preference training with native multi-GPU support.
+
+## Scope
+
+Grimoire does **offline** fine-tuning: every loss is a pure function of `(model, batch)` over a fixed, pre-tokenized dataset — SFT plus the preference and reward-model losses. Online RL — generating completions during training and scoring them against a reward function or environment (GRPO, PPO, …) — is intentionally out of scope: that needs `model.generate()` in the loop plus a reward/environment interface, which doesn't fit the pure `loss_fn` abstraction. It lives in a separate RL library that builds on grimoire.
 
 ## Install
 
@@ -116,7 +120,7 @@ trainer = GrimoireTrainer(
 
 ## Guides
 
-- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 8 methods
+- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 7 methods
 - **[Loss Formulas](docs/loss-formulas.md)** — Side-by-side math for every loss function
 - **[Callbacks](docs/callbacks.md)** — Hooking into the training loop for logging, early stopping, and more
 - **[Multi-GPU, DeepSpeed, and FSDP](docs/deepspeed.md)** — Distributed training setup, example configs, and memory tips
