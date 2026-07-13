@@ -236,7 +236,7 @@ grimoire/
 │   ├── kto.py         # KTO loss — unpaired binary feedback
 │   ├── cpo.py         # CPO loss — reference-free + contrastive preference
 │   ├── ipo.py         # IPO loss — squared loss variant of DPO
-│   └── grpo.py        # GRPO loss — group relative policy optimization
+│   └── grpo.py        # GRPOMethod — online RL (rollout + REINFORCE loss)
 └── data/
     ├── sft.py         # SFTCollator + tokenize_sft()
     ├── preference.py  # PreferenceCollator + tokenize_preference()

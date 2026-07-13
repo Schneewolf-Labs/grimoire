@@ -21,6 +21,7 @@ from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.grpo import GRPOMethod
 
 
 class TinyLM(nn.Module):
@@ -1625,3 +1626,115 @@ class TestLigerKernel:
                 )
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class GenerativeTinyLM(TinyLM):
+    """TinyLM with a generate() method, for exercising the GRPO rollout phase."""
+
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=4,
+                 temperature=1.0, do_sample=True, pad_token_id=0, use_cache=None):
+        gen = input_ids
+        for _ in range(max_new_tokens):
+            logits = self.forward(gen).logits[:, -1, :]
+            probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
+            nxt = torch.multinomial(probs, num_samples=1)
+            gen = torch.cat([gen, nxt], dim=1)
+        return gen
+
+
+class DecodingTokenizer(FakeTokenizer):
+    """FakeTokenizer plus batch_decode, which GRPO's rollout needs."""
+
+    def batch_decode(self, ids, skip_special_tokens=True):
+        return [" ".join(map(str, row.tolist())) for row in ids]
+
+
+def make_grpo_prompt_dataset(n=16, prompt_len=6, vocab_size=64):
+    """Prompt-only dataset for GRPO (completions are generated during training)."""
+    data = {
+        "input_ids": [torch.randint(2, vocab_size, (prompt_len,)).tolist() for _ in range(n)],
+        "attention_mask": [[1] * prompt_len for _ in range(n)],
+    }
+    return Dataset.from_dict(data)
+
+
+class TestGRPORolloutHook:
+    """The trainer runs an online method's rollout() before the loss."""
+
+    def test_rollout_hook_runs_grpo_end_to_end(self):
+        torch.manual_seed(0)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            model = GenerativeTinyLM()
+            method = GRPOMethod(
+                reward_fn=lambda prompts, completions: [float(len(c)) for c in completions],
+                tokenizer=DecodingTokenizer(),
+                num_generations=2,
+                beta=0.0,
+                max_new_tokens=4,
+                fused=False,
+            )
+            config = TrainingConfig(
+                output_dir=tmpdir,
+                num_epochs=1,
+                batch_size=4,
+                learning_rate=1e-3,
+                mixed_precision="no",
+                gradient_checkpointing=False,
+                logging_steps=1,
+                save_on_epoch_end=False,
+            )
+            seen = []
+
+            class MetricSpy(TrainerCallback):
+                def on_step_end(self, trainer, step, loss, metrics):
+                    seen.append(metrics)
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=DecodingTokenizer(),
+                config=config,
+                loss_fn=method,
+                train_dataset=make_grpo_prompt_dataset(n=16),
+                callbacks=[MetricSpy()],
+            )
+            trainer.train()
+
+            # These metrics only exist if rollout() produced an experience batch
+            # that the loss then consumed — proof the rollout hook fired.
+            assert seen and "rewards_mean" in seen[0]
+            assert "policy_loss" in seen[0]
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_zero3_guard_rejects_rollout_method(self, monkeypatch):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            trainer = GrimoireTrainer(
+                model=GenerativeTinyLM(),
+                tokenizer=DecodingTokenizer(),
+                config=TrainingConfig(
+                    output_dir=tmpdir, mixed_precision="no", gradient_checkpointing=False,
+                ),
+                loss_fn=GRPOMethod(
+                    reward_fn=lambda p, c: [0.0] * len(c),
+                    tokenizer=DecodingTokenizer(), num_generations=2, beta=0.0,
+                ),
+                train_dataset=make_grpo_prompt_dataset(n=4),
+            )
+            # Simulate a DeepSpeed ZeRO-3 setup. deepspeed_plugin is a read-only
+            # property on the (singleton) AcceleratorState, so patch it on the
+            # class; monkeypatch restores it after the test.
+            monkeypatch.setattr(
+                type(trainer.accelerator.state), "deepspeed_plugin",
+                property(lambda self: types.SimpleNamespace(zero_stage=3)),
+            )
+            with pytest.raises(RuntimeError, match="ZeRO-3"):
+                trainer._check_rollout_compat()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_offline_loss_has_no_rollout_hook(self):
+        """Offline losses must not expose rollout() — the trainer skips the hook."""
+        assert not hasattr(SFTLoss(), "rollout")
+        assert not hasattr(DPOLoss(ref_model=TinyLM().eval()), "rollout")

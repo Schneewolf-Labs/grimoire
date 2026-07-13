@@ -119,7 +119,7 @@ log_ratio(y) = avg_logp_pi(y|x) - avg_logp_ref(y|x)
 
 [arXiv:2402.03300](https://arxiv.org/abs/2402.03300)
 
-Group Relative Policy Optimization. Generates G completions per prompt, scores them with a reward function, normalizes rewards within each group, and optimizes with a clipped REINFORCE objective. No pre-labeled data or reference model needed.
+Group Relative Policy Optimization — grimoire's one **online** method (`GRPOMethod`), not a plain loss. Its `rollout` phase generates G completions per prompt, scores them with a reward function, and normalizes rewards within each group into advantages; the loss phase below then optimizes a clipped REINFORCE objective over that experience. No pre-labeled data needed.
 
 ```
 L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL

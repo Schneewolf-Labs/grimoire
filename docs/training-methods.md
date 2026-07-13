@@ -237,16 +237,17 @@ undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 
 ## GRPO
 
-Group Relative Policy Optimization. Generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
+Group Relative Policy Optimization. Grimoire's one **online** method: it generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
+
+Unlike the offline losses, `GRPOMethod` is two-phase. It exposes a `rollout(model, batch)` method that the trainer calls before the loss each step — that's where generation, reward scoring, and advantage estimation happen. Its `__call__` is then a pure loss over the resulting experience batch. You don't call `rollout` yourself; passing a `GRPOMethod` as `loss_fn` is all that's needed.
 
 - **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
 - **Memory:** Very high (generation + two forward passes per batch)
 - **Key params:** `reward_fn` — callable `(prompts, completions) → list[float]`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
-- **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access
+- **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access; the trainer enforces this
 
 ```python
-import copy
-from grimoire.losses import GRPOLoss
+from grimoire.losses import GRPOMethod
 from grimoire.data import tokenize_grpo
 
 # Dataset needs only prompts — no responses required
@@ -261,7 +262,7 @@ def reward_fn(prompts, completions):
 
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
+    loss_fn=GRPOMethod(
         reward_fn=reward_fn,
         tokenizer=tokenizer,
         num_generations=4,
