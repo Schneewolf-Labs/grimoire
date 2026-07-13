@@ -1,13 +1,13 @@
 # Choosing a Training Method
 
-Grimoire supports 8 training methods. This guide helps you pick the right one.
+Grimoire supports 11 training methods. This guide helps you pick the right one.
 
 ## Start here: What data do you have?
 
 - **Prompt + completion examples** (no preference pairs) → [**SFT**](#sft)
 - **Thumbs-up / thumbs-down per response** (unpaired feedback) → [**KTO**](#kto)
 - **Chosen + rejected response pairs** → see [preference methods](#preference-methods) below
-- **Prompts + a reward function** (generate and score on-the-fly) → [**GRPO**](#grpo)
+- **Prompts + a reward function** (generate and score on-the-fly) → see [online methods](#online-methods): [**GRPO**](#grpo), [**RLOO**](#rloo), [**Online DPO**](#online-dpo), [**RAFT**](#raft)
 
 ## SFT
 
@@ -235,19 +235,16 @@ desirable_loss   = lambda_d * (1 - sigmoid(beta * (log_ratio - KL_ref)))
 undesirable_loss = lambda_u * (1 - sigmoid(beta * (KL_ref - log_ratio)))
 ```
 
-## GRPO
+## Online Methods
 
-Group Relative Policy Optimization. Grimoire's one **online** method: it generates multiple completions per prompt, scores them with a reward function, and optimizes with a clipped REINFORCE objective. No pre-labeled responses needed — the model learns from its own generations.
+The online methods need no pre-labeled responses — the model learns from its own generations, scored by a reward function you write. They all share the same setup:
 
-Unlike the offline losses, `GRPOMethod` is two-phase. It exposes a `rollout(model, batch)` method that the trainer calls before the loss each step — that's where generation, reward scoring, and advantage estimation happen. Its `__call__` is then a pure loss over the resulting experience batch. You don't call `rollout` yourself; passing a `GRPOMethod` as `loss_fn` is all that's needed.
-
-- **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
-- **Memory:** Very high (generation + two forward passes per batch)
-- **Key params:** `reward_fn` — callable `(prompts, completions) → list[float]`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
-- **Constraint:** Requires ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access; the trainer enforces this
+- **Data:** prompts only, tokenized with `tokenize_grpo` (registry alias: `prompt`)
+- **Reward function:** a callable `(prompts, completions) → list[float]`
+- **Two phases:** each method exposes a `rollout(model, batch)` that the trainer calls before the loss each step — that's where generation, reward scoring, and experience-building happen. Its `__call__` is then a pure loss over the resulting experience batch. You don't call `rollout` yourself; passing the method as `loss_fn` is all that's needed.
+- **Constraint:** ZeRO-2 or lower (or FSDP), not ZeRO-3 — `model.generate()` needs full weight access; the trainer enforces this
 
 ```python
-from grimoire.losses import GRPOMethod
 from grimoire.data import tokenize_grpo
 
 # Dataset needs only prompts — no responses required
@@ -259,6 +256,28 @@ dataset = dataset.map(
 def reward_fn(prompts, completions):
     # Return a score for each (prompt, completion) pair
     return [score_completion(p, c) for p, c in zip(prompts, completions)]
+```
+
+Which one?
+
+| Method | When to use |
+|--------|-------------|
+| [RAFT](#raft) | Start here. Simplest possible online method (best-of-N + SFT), almost nothing to misconfigure. |
+| [GRPO](#grpo) | The standard for verifiable rewards (math, code). Group-normalized REINFORCE. |
+| [RLOO](#rloo) | Like GRPO but with an unbiased leave-one-out baseline and no std scaling — try it when GRPO is noisy on near-uniform rewards. |
+| [Online DPO](#online-dpo) | You trust preference-style learning (DPO) but want the pairs to track the current policy instead of a static dataset. |
+
+### GRPO
+
+Group Relative Policy Optimization. Generates G completions per prompt, scores them, normalizes rewards within each group into advantages, and optimizes a clipped REINFORCE objective.
+
+- **Best for:** Tasks with a verifiable reward signal (math, code, structured output) where writing a scorer is easier than collecting preference pairs
+- **Memory:** Very high (generation + two forward passes per batch)
+- **Key params:** `reward_fn`; `num_generations` (default 4) — completions per prompt; `beta` (default 0.04) — KL penalty; `epsilon` (default 0.2) — clip ratio
+- **Bias-fix options:** `scale_rewards=False` (Dr. GRPO — drop the std division), `loss_type="dr_grpo"` (length-bias fix), `dynamic_sampling=True` (DAPO — exclude zero-variance groups from the loss average)
+
+```python
+from grimoire.losses import GRPOMethod
 
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
@@ -285,6 +304,87 @@ advantages    = (r - mean(r_group)) / std(r_group)   # normalized within group o
 KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 ```
 
+### RLOO
+
+REINFORCE Leave-One-Out. Same rollout as GRPO, but each completion's baseline is the mean reward of the *other* G-1 completions in its group, with no std normalization. This is plain REINFORCE with an unbiased baseline — the std division GRPO applies can amplify noise when a group's rewards barely differ; RLOO sidesteps that entirely.
+
+- **Best for:** The same tasks as GRPO, with cleaner statistics — a good default when rewards are near-uniform within groups
+- **Memory:** Same as GRPO
+- **Key params:** `reward_fn`; `num_generations` (default 4, must be ≥ 2); `beta` (default 0.04) — KL penalty
+
+```python
+from grimoire.losses import RLOOMethod
+
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=RLOOMethod(
+        reward_fn=reward_fn,
+        tokenizer=tokenizer,
+        num_generations=4,
+    ),
+    train_dataset=dataset,
+)
+```
+
+**Advantage formula:**
+```
+A_i = r_i - mean(r_j, j != i)     # no std scaling
+```
+
+### Online DPO
+
+Generates G completions per prompt (default 2), scores them, takes the highest- and lowest-reward completion as the (chosen, rejected) pair, and applies the standard DPO loss. Offline DPO's weakness is that its static pairs go off-distribution as the policy moves; here the pairs are re-sampled from the current policy every step.
+
+- **Best for:** Preference-style alignment when you have a reward model or judge instead of a preference dataset
+- **Memory:** Very high (generation + reference + policy forwards)
+- **Key params:** `reward_fn`; `num_generations` (default 2, higher = best-of-G vs worst-of-G contrast); `beta` (default 0.1)
+- **Requires a reference policy:** `ref_model`, or a PEFT model (base weights via `disable_adapter()`)
+
+```python
+from grimoire.losses import OnlineDPOMethod
+
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=OnlineDPOMethod(
+        reward_fn=reward_fn,
+        tokenizer=tokenizer,
+        num_generations=2,
+        beta=0.1,
+        # ref_model=ref_model,  # omit for PEFT models
+    ),
+    train_dataset=dataset,
+)
+```
+
+**Loss formula:** identical to [DPO](#dpo), over pairs generated on-policy each step.
+
+### RAFT
+
+Reward-rAnked FineTuning (best-of-N rejection sampling). Generates G completions per prompt, keeps only the highest-reward one, and applies plain SFT loss to it. The reward only ever enters through the argmax, so there's no advantage estimation, no KL, no reference model — the simplest, hardest-to-misconfigure online method.
+
+- **Best for:** A first online experiment, or when GRPO-style methods are unstable on your reward
+- **Memory:** High (generation + one forward pass per batch — no reference model)
+- **Key params:** `reward_fn`; `num_generations` (default 4) — higher = stronger selection pressure
+
+```python
+from grimoire.losses import RAFTMethod
+
+trainer = GrimoireTrainer(
+    model=model, tokenizer=tokenizer, config=config,
+    loss_fn=RAFTMethod(
+        reward_fn=reward_fn,
+        tokenizer=tokenizer,
+        num_generations=4,
+    ),
+    train_dataset=dataset,
+)
+```
+
+**Loss formula:**
+```
+L_RAFT = L_SFT(argmax_reward completion per prompt)
+```
+
 ## Quick Reference
 
 | Method | Data Format | Ref Model | Memory | Best For |
@@ -297,6 +397,9 @@ KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 | IPO | Paired | Yes | High | Noisy preference data |
 | KTO | Unpaired | Yes | High | Binary feedback (no pairs) |
 | GRPO | Prompts only | No | Very high | Verifiable reward signal (math, code) |
+| RLOO | Prompts only | No | Very high | GRPO alternative, unbiased baseline |
+| Online DPO | Prompts only | Yes | Very high | On-policy preference pairs from a reward fn |
+| RAFT | Prompts only | No | High | Simplest online method (best-of-N + SFT) |
 
 ## Typical Training Pipelines
 
@@ -304,4 +407,4 @@ KL            = mean(log_pi_old(y|x) - log_pi(y|x))
 2. **Base model → aligned in one step:** ORPO or CPO
 3. **SFT model → aligned:** DPO, SimPO, or IPO
 4. **SFT model → aligned from user feedback:** KTO
-5. **SFT model → aligned with a reward function:** GRPO
+5. **SFT model → aligned with a reward function:** RAFT first, then GRPO or RLOO; Online DPO if you prefer preference-style updates

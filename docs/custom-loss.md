@@ -65,8 +65,8 @@ def __call__(self, model, batch, training=True):
 Most methods are **offline** — a pure function of `(model, batch)` where `batch`
 comes straight from a fixed dataset. Some methods are **online**: they need to
 *generate* completions during training and score them against a reward function
-or environment (GRPO is the built-in example). For those, define an optional
-`rollout(model, batch)` method:
+or environment (GRPO, RLOO, Online DPO, and RAFT are the built-in examples).
+For those, define an optional `rollout(model, batch)` method:
 
 ```python
 class MyOnlineMethod:
@@ -97,6 +97,12 @@ Two constraints come with generating during training:
 - **Model unwrapping:** generation needs the unwrapped model (DDP/FSDP wrappers
   don't forward `.generate()`), while the loss forward wants the wrapped one for
   gradient sync. Unwrap inside `rollout` (see `GRPOMethod` for the pattern).
+
+The easiest starting point is subclassing `grimoire.losses.OnlineMethod` —
+it owns the shared rollout building blocks (generation from left-padded
+prompts, post-EOS masking, reward scoring, frozen-reference log-probs), so
+your method only writes its `rollout()` experience-building and its loss.
+`RAFTMethod` is the smallest worked example.
 
 ## Metrics
 

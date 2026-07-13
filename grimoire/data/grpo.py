@@ -2,10 +2,11 @@ import torch
 
 
 class GRPOCollator:
-    """Left-pads prompt-only sequences for GRPO training.
+    """Left-pads prompt-only sequences for online-method training.
 
-    GRPO only needs prompts — completions are generated during training.
-    Each example has input_ids and attention_mask (no labels).
+    Online methods (GRPO/RLOO/Online DPO/RAFT) only need prompts —
+    completions are generated during training. Each example has input_ids
+    and attention_mask (no labels).
 
     Prompts are LEFT-padded: decoder-only generation requires the prompt to
     end at the last position so completions directly continue it. With right
@@ -39,10 +40,10 @@ def tokenize_grpo(
     max_prompt_length=512,
     prompt_field="prompt",
 ):
-    """Tokenize a prompt for GRPO training (no response).
+    """Tokenize a prompt for online-method training (no response).
 
-    GRPO generates completions on-the-fly during training, so only prompts
-    are tokenized ahead of time.
+    Online methods (GRPO/RLOO/Online DPO/RAFT) generate completions
+    on-the-fly during training, so only prompts are tokenized ahead of time.
 
     Use with dataset.map():
         dataset = dataset.map(

@@ -20,6 +20,9 @@ LOSSES: dict[str, str] = {
     "cpo":    "grimoire.losses.cpo:CPOLoss",
     "ipo":    "grimoire.losses.ipo:IPOLoss",
     "grpo":   "grimoire.losses.grpo:GRPOMethod",
+    "rloo":   "grimoire.losses.rloo:RLOOMethod",
+    "online_dpo": "grimoire.losses.online_dpo:OnlineDPOMethod",
+    "raft":   "grimoire.losses.raft:RAFTMethod",
     "reward": "grimoire.losses.reward:RewardModelLoss",
 }
 
@@ -29,6 +32,9 @@ TOKENIZERS: dict[str, str] = {
     "preference": "grimoire.data.preference:tokenize_preference",
     "kto":        "grimoire.data.kto:tokenize_kto",
     "grpo":       "grimoire.data.grpo:tokenize_grpo",
+    # alias: every online method (grpo/rloo/online_dpo/raft) trains from
+    # prompt-only data tokenized the same way
+    "prompt":     "grimoire.data.grpo:tokenize_grpo",
 }
 
 

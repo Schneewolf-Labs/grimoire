@@ -116,7 +116,7 @@ trainer = GrimoireTrainer(
 
 ## Guides
 
-- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 8 methods
+- **[Choosing a Training Method](docs/training-methods.md)** — Decision tree, quick reference table, and code examples for all 11 methods
 - **[Loss Formulas](docs/loss-formulas.md)** — Side-by-side math for every loss function
 - **[Callbacks](docs/callbacks.md)** — Hooking into the training loop for logging, early stopping, and more
 - **[Multi-GPU, DeepSpeed, and FSDP](docs/deepspeed.md)** — Distributed training setup, example configs, and memory tips
@@ -236,7 +236,11 @@ grimoire/
 │   ├── kto.py         # KTO loss — unpaired binary feedback
 │   ├── cpo.py         # CPO loss — reference-free + contrastive preference
 │   ├── ipo.py         # IPO loss — squared loss variant of DPO
-│   └── grpo.py        # GRPOMethod — online RL (rollout + REINFORCE loss)
+│   ├── online.py      # OnlineMethod base — shared rollout machinery
+│   ├── grpo.py        # GRPOMethod — online RL (group-relative REINFORCE)
+│   ├── rloo.py        # RLOOMethod — online RL (leave-one-out baseline)
+│   ├── online_dpo.py  # OnlineDPOMethod — on-policy pairs + DPO loss
+│   └── raft.py        # RAFTMethod — best-of-N rejection sampling + SFT
 └── data/
     ├── sft.py         # SFTCollator + tokenize_sft()
     ├── preference.py  # PreferenceCollator + tokenize_preference()

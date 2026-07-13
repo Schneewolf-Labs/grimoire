@@ -1,4 +1,5 @@
-"""Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, and GRPO loss functions."""
+"""Tests for SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, and online (GRPO/RLOO/
+Online DPO/RAFT) loss functions."""
 
 import copy
 from contextlib import contextmanager
@@ -15,6 +16,9 @@ from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
 from grimoire.losses.grpo import GRPOMethod
+from grimoire.losses.rloo import RLOOMethod
+from grimoire.losses.online_dpo import OnlineDPOMethod
+from grimoire.losses.raft import RAFTMethod
 from grimoire.losses.reward import RewardModelLoss
 from grimoire.data.cache import cache_reference_log_probs
 
@@ -1132,6 +1136,322 @@ class TestGRPOMethod:
         mask = method._completion_mask(completion_ids)
 
         assert mask.tolist() == [[1, 1, 0, 0], [1, 1, 1, 1]]
+
+
+def _increasing_reward_fn(prompts, completions):
+    """Reward function scoring by position — within a group of G, the last
+    generation is always best and the first always worst."""
+    return [float(i) for i in range(len(prompts))]
+
+
+class TestGRPOOptions:
+    """Dr. GRPO (scale_rewards / loss_type) and DAPO (dynamic_sampling) options."""
+
+    def _make_method(self, **kwargs):
+        model = GenerativeModel()
+        method = GRPOMethod(
+            reward_fn=kwargs.pop("reward_fn", _length_reward_fn),
+            tokenizer=MockTokenizer(),
+            num_generations=kwargs.pop("num_generations", 2),
+            max_new_tokens=4,
+            **kwargs,
+        )
+        method._pad_token_id = 0
+        return model, method
+
+    def test_scale_rewards_true_divides_by_std(self):
+        _, method = self._make_method(scale_rewards=True)
+        rewards = torch.tensor([0.0, 2.0])
+        adv = method._compute_advantages(rewards, B=1, G=2)
+        # mean=1, deviations [-1, 1], sample std = sqrt(2)
+        expected = torch.tensor([-1.0, 1.0]) / torch.tensor(2.0).sqrt()
+        assert torch.allclose(adv, expected)
+
+    def test_scale_rewards_false_leaves_raw_deviations(self):
+        _, method = self._make_method(scale_rewards=False)
+        rewards = torch.tensor([0.0, 2.0])
+        adv = method._compute_advantages(rewards, B=1, G=2)
+        assert torch.allclose(adv, torch.tensor([-1.0, 1.0]))
+
+    def test_dr_grpo_loss_runs(self):
+        torch.manual_seed(42)
+        model, method = self._make_method(loss_type="dr_grpo")
+        experience = method.rollout(model, _make_grpo_batch())
+        loss, metrics = method(model, experience, training=True)
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert loss.requires_grad
+
+    def test_invalid_loss_type_raises(self):
+        with pytest.raises(ValueError, match="loss_type"):
+            GRPOMethod(
+                reward_fn=_length_reward_fn,
+                tokenizer=MockTokenizer(),
+                loss_type="ppo",
+            )
+
+    def test_dynamic_sampling_masks_zero_variance_groups(self):
+        """Constant rewards → every group is zero-variance → all masked out."""
+        torch.manual_seed(42)
+        model, method = self._make_method(
+            reward_fn=_constant_reward_fn, dynamic_sampling=True, beta=0.0,
+        )
+        experience = method.rollout(model, _make_grpo_batch())
+
+        assert experience["rollout_metrics"]["zero_variance_groups"] == 1.0
+        assert experience["advantage_mask"].sum().item() == 0.0
+
+        loss, metrics = method(model, experience, training=True)
+        assert loss.item() == 0.0
+        assert loss.requires_grad  # still graph-connected for DDP grad sync
+
+    def test_dynamic_sampling_keeps_informative_groups(self):
+        torch.manual_seed(42)
+        model, method = self._make_method(
+            reward_fn=_increasing_reward_fn, dynamic_sampling=True, beta=0.0,
+        )
+        experience = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert experience["rollout_metrics"]["zero_variance_groups"] == 0.0
+        assert experience["advantage_mask"].sum().item() == 4.0  # B=2 * G=2
+
+    def test_no_dynamic_sampling_has_no_mask(self):
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        experience = method.rollout(model, _make_grpo_batch())
+        assert experience["advantage_mask"] is None
+        assert "zero_variance_groups" not in experience["rollout_metrics"]
+
+
+class TestRLOOMethod:
+    def _make_method(self, reward_fn=None, num_generations=2, beta=0.04):
+        model = GenerativeModel()
+        method = RLOOMethod(
+            reward_fn=reward_fn or _length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=num_generations,
+            beta=beta,
+            max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+        return model, method
+
+    @staticmethod
+    def _step(model, method, batch):
+        experience = method.rollout(model, batch)
+        return method(model, experience, training=True)
+
+    def test_leave_one_out_advantages(self):
+        """A_i = r_i - mean of the OTHER G-1 rewards, no std scaling."""
+        _, method = self._make_method(num_generations=4)
+        rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        adv = method._compute_advantages(rewards, B=1, G=4)
+        expected = torch.tensor([1 - 3.0, 2 - 8 / 3, 3 - 7 / 3, 4 - 2.0])
+        assert torch.allclose(adv, expected)
+
+    def test_advantages_sum_to_zero_within_group(self):
+        _, method = self._make_method(num_generations=4)
+        rewards = torch.rand(8)  # B=2, G=4
+        adv = method._compute_advantages(rewards, B=2, G=4).view(2, 4)
+        assert torch.allclose(adv.sum(dim=1), torch.zeros(2), atol=1e-6)
+
+    def test_returns_scalar_loss_and_metrics(self):
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        loss, metrics = self._step(model, method, _make_grpo_batch())
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert loss.requires_grad
+        assert "rewards_mean" in metrics
+        assert "policy_loss" in metrics
+
+    def test_requires_at_least_two_generations(self):
+        with pytest.raises(ValueError, match="num_generations"):
+            RLOOMethod(
+                reward_fn=_length_reward_fn,
+                tokenizer=MockTokenizer(),
+                num_generations=1,
+            )
+
+    def test_kl_with_ref_model(self):
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        ref_model = GenerativeModel()
+        ref_model.eval()
+        method.ref_model = ref_model
+        loss, metrics = self._step(model, method, _make_grpo_batch())
+
+        assert metrics["kl"] >= 0.0
+        assert not torch.isnan(loss)
+
+    def test_creates_grpo_collator(self):
+        _, method = self._make_method()
+        from grimoire.data.grpo import GRPOCollator
+        assert isinstance(method.create_collator(pad_token_id=0), GRPOCollator)
+
+    def test_eval_returns_zero_loss(self):
+        model, method = self._make_method()
+        loss, _ = method(model, _make_grpo_batch(), training=False)
+        assert loss.item() == 0.0
+
+
+class TestOnlineDPOMethod:
+    def _make_method(self, reward_fn=None, num_generations=2, ref_model=None):
+        model = GenerativeModel()
+        if ref_model is None:
+            ref_model = GenerativeModel()
+            ref_model.eval()
+        method = OnlineDPOMethod(
+            reward_fn=reward_fn or _length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=num_generations,
+            beta=0.1,
+            max_new_tokens=4,
+            ref_model=ref_model,
+        )
+        method._pad_token_id = 0
+        return model, method
+
+    @staticmethod
+    def _step(model, method, batch):
+        experience = method.rollout(model, batch)
+        return method(model, experience, training=True)
+
+    def test_rollout_returns_pair_batch(self):
+        """rollout() stacks B chosen rows above B rejected rows."""
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["input_ids"].size(0) == 4  # 2 chosen + 2 rejected
+        assert exp["ref_chosen_logps"].shape == (2,)
+        assert exp["ref_rejected_logps"].shape == (2,)
+        for key in ("attention_mask", "labels"):
+            assert exp[key].shape == exp["input_ids"].shape
+
+    def test_chosen_is_best_of_group(self):
+        """With position-increasing rewards, chosen - rejected == G - 1."""
+        torch.manual_seed(42)
+        model, method = self._make_method(
+            reward_fn=_increasing_reward_fn, num_generations=4,
+        )
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["rollout_metrics"]["reward_margin"] == pytest.approx(3.0)
+
+    def test_returns_scalar_loss_and_metrics(self):
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        loss, metrics = self._step(model, method, _make_grpo_batch())
+
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert loss.requires_grad
+        assert "reward_margin" in metrics
+        assert "implicit_reward_margin" in metrics
+        assert "implicit_reward_accuracy" in metrics
+
+    def test_requires_reference_policy(self):
+        """No ref_model and no disable_adapter() → rollout raises."""
+        torch.manual_seed(42)
+        model = GenerativeModel()
+        method = OnlineDPOMethod(
+            reward_fn=_length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=2,
+            max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+
+        with pytest.raises(ValueError, match="reference policy"):
+            method.rollout(model, _make_grpo_batch())
+
+    def test_requires_at_least_two_generations(self):
+        with pytest.raises(ValueError, match="num_generations"):
+            OnlineDPOMethod(
+                reward_fn=_length_reward_fn,
+                tokenizer=MockTokenizer(),
+                num_generations=1,
+            )
+
+    def test_ref_model_must_be_eval(self):
+        with pytest.raises(ValueError, match="eval mode"):
+            OnlineDPOMethod(
+                reward_fn=_length_reward_fn,
+                tokenizer=MockTokenizer(),
+                ref_model=GenerativeModel(),  # still in training mode
+            )
+
+    def test_creates_grpo_collator(self):
+        _, method = self._make_method()
+        from grimoire.data.grpo import GRPOCollator
+        assert isinstance(method.create_collator(pad_token_id=0), GRPOCollator)
+
+    def test_eval_returns_zero_loss(self):
+        model, method = self._make_method()
+        loss, _ = method(model, _make_grpo_batch(), training=False)
+        assert loss.item() == 0.0
+
+
+class TestRAFTMethod:
+    def _make_method(self, reward_fn=None, num_generations=4):
+        model = GenerativeModel()
+        method = RAFTMethod(
+            reward_fn=reward_fn or _length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=num_generations,
+            max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+        return model, method
+
+    @staticmethod
+    def _step(model, method, batch):
+        experience = method.rollout(model, batch)
+        return method(model, experience, training=True)
+
+    def test_rollout_keeps_one_winner_per_prompt(self):
+        torch.manual_seed(42)
+        model, method = self._make_method(num_generations=4)
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["input_ids"].size(0) == 2  # B rows, not B*G
+        for key in ("attention_mask", "labels"):
+            assert exp[key].shape == exp["input_ids"].shape
+
+    def test_best_reward_is_group_max(self):
+        """With position-increasing rewards, winners are rows G-1 and 2G-1."""
+        torch.manual_seed(42)
+        model, method = self._make_method(
+            reward_fn=_increasing_reward_fn, num_generations=4,
+        )
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        # groups score [0..3] and [4..7] → max 3 and 7 → mean 5
+        assert exp["rollout_metrics"]["best_reward"] == pytest.approx(5.0)
+
+    def test_loss_is_nll_on_winners(self):
+        """The loss phase is plain SFT: positive NLL with gradients."""
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        loss, metrics = self._step(model, method, _make_grpo_batch())
+
+        assert loss.dim() == 0
+        assert loss.item() > 0  # NLL is positive
+        assert loss.requires_grad
+        assert "best_reward" in metrics
+
+    def test_creates_grpo_collator(self):
+        _, method = self._make_method()
+        from grimoire.data.grpo import GRPOCollator
+        assert isinstance(method.create_collator(pad_token_id=0), GRPOCollator)
+
+    def test_eval_returns_zero_loss(self):
+        model, method = self._make_method()
+        loss, _ = method(model, _make_grpo_batch(), training=False)
+        assert loss.item() == 0.0
 
 
 def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):
