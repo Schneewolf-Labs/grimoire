@@ -1271,3 +1271,38 @@ class TestRewardModelLoss:
         from grimoire.data.preference import PreferenceCollator
         collator = loss_fn.create_collator(pad_token_id=0)
         assert isinstance(collator, PreferenceCollator)
+
+
+class TestReferenceForwardOrdering:
+    """The frozen reference pass must run BEFORE the policy forward — running
+    it first keeps its activations from coexisting with the policy's autograd
+    graph, which lowers peak memory."""
+
+    @staticmethod
+    def _tag(model, name, calls):
+        model.register_forward_pre_hook(lambda module, args: calls.append(name))
+
+    def _assert_ref_first(self, loss_cls, batch, **kwargs):
+        calls = []
+        torch.manual_seed(0)
+        model = SimpleModel()
+        ref_model = SimpleModel()
+        ref_model.eval()
+        self._tag(model, "policy", calls)
+        self._tag(ref_model, "ref", calls)
+
+        loss_fn = loss_cls(ref_model=ref_model, **kwargs)
+        loss_fn._pad_token_id = 0
+        loss, _ = loss_fn(model, batch, training=True)
+
+        assert calls == ["ref", "policy"]
+        assert not torch.isnan(loss)
+
+    def test_dpo_ref_runs_first(self):
+        self._assert_ref_first(DPOLoss, _make_preference_batch(), beta=0.1)
+
+    def test_ipo_ref_runs_first(self):
+        self._assert_ref_first(IPOLoss, _make_preference_batch(), beta=0.1)
+
+    def test_kto_ref_runs_first(self):
+        self._assert_ref_first(KTOLoss, _make_kto_batch(), beta=0.1)

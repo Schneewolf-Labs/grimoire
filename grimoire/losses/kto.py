@@ -2,7 +2,12 @@ import torch
 import torch.nn.functional as F
 
 from ..data.kto import KTOCollator
-from .utils import get_batch_logps, _disable_grad_checkpointing
+from .utils import (
+    DEFAULT_FUSED_CHUNK_SIZE,
+    _disable_grad_checkpointing,
+    forward_per_token_logps,
+    masked_avg_logps,
+)
 
 
 class KTOLoss:
@@ -23,7 +28,8 @@ class KTOLoss:
     Requires a frozen reference model to compute baseline log-probabilities.
     """
 
-    def __init__(self, ref_model=None, beta=0.1, lambda_d=1.0, lambda_u=1.0, label_pad_token_id=-100):
+    def __init__(self, ref_model=None, beta=0.1, lambda_d=1.0, lambda_u=1.0, label_pad_token_id=-100,
+                 fused=True, fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE):
         if ref_model is not None and ref_model.training:
             raise ValueError("ref_model must be in eval mode (call ref_model.eval() first)")
         self.ref_model = ref_model
@@ -31,6 +37,8 @@ class KTOLoss:
         self.lambda_d = lambda_d
         self.lambda_u = lambda_u
         self.label_pad_token_id = label_pad_token_id
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
         self._pad_token_id = 0
 
     def __call__(self, model, batch, training=True):
@@ -42,6 +50,13 @@ class KTOLoss:
         self._pad_token_id = pad_token_id
         return KTOCollator(pad_token_id=pad_token_id, label_pad_token_id=self.label_pad_token_id)
 
+    def _avg_logps(self, model, input_ids, attention_mask, labels):
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model, input_ids, attention_mask, labels, self.label_pad_token_id,
+            fused=self.fused, fused_chunk_size=self.fused_chunk_size,
+        )
+        return masked_avg_logps(per_token_logps, loss_mask)
+
     def _train_forward(self, model, batch):
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -49,27 +64,24 @@ class KTOLoss:
         kto_label = batch["kto_label"]  # bool tensor: True=desirable, False=undesirable
         device = input_ids.device
 
-        # Policy log-probs
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        policy_logps = get_batch_logps(logits, labels, self.label_pad_token_id)
-        del logits
-
-        # Reference log-probs: use cached values if available, else compute
+        # Reference log-probs: cached values, or a no-grad forward.  The
+        # frozen pass runs BEFORE the policy forward so its activations never
+        # coexist with the policy's autograd graph — lower peak memory.
         if "ref_logps" in batch:
-            del input_ids, attention_mask, labels  # Free batch tensors
-            ref_logps = batch["ref_logps"].to(policy_logps.device)
+            ref_logps = batch["ref_logps"].to(device)
         else:
             with torch.no_grad():
                 if self.ref_model is not None:
-                    ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                    ref_logps = self._avg_logps(self.ref_model, input_ids, attention_mask, labels)
                 elif hasattr(model, "disable_adapter"):
                     with _disable_grad_checkpointing(model), model.disable_adapter():
-                        ref_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                        ref_logps = self._avg_logps(model, input_ids, attention_mask, labels)
                 else:
                     raise ValueError("KTOLoss requires either a ref_model, cached ref log probs in the batch, or a PEFT model with disable_adapter()")
-                del input_ids, attention_mask  # Free batch tensors
-                ref_logps = get_batch_logps(ref_logits, labels, self.label_pad_token_id)
-                del ref_logits, labels
+
+        # Policy log-probs
+        policy_logps = self._avg_logps(model, input_ids, attention_mask, labels)
+        del input_ids, attention_mask, labels  # Free batch tensors
 
         # Log ratios and KL estimate
         log_ratio = policy_logps - ref_logps

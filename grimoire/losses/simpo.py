@@ -1,7 +1,12 @@
 import torch.nn.functional as F
 
 from ..data.preference import PreferenceCollator
-from .utils import get_batch_logps, concatenate_preference
+from .utils import (
+    DEFAULT_FUSED_CHUNK_SIZE,
+    concatenate_preference,
+    forward_per_token_logps,
+    masked_avg_logps,
+)
 
 
 class SimPOLoss:
@@ -16,10 +21,13 @@ class SimPOLoss:
     as an implicit reward, with a target reward margin gamma.
     """
 
-    def __init__(self, beta=2.0, gamma=0.5, label_pad_token_id=-100):
+    def __init__(self, beta=2.0, gamma=0.5, label_pad_token_id=-100, fused=True,
+                 fused_chunk_size=DEFAULT_FUSED_CHUNK_SIZE):
         self.beta = beta
         self.gamma = gamma
         self.label_pad_token_id = label_pad_token_id
+        self.fused = fused
+        self.fused_chunk_size = fused_chunk_size
         self._pad_token_id = 0
 
     def __call__(self, model, batch, training=True):
@@ -37,10 +45,12 @@ class SimPOLoss:
         # Concatenate chosen + rejected for a single forward pass
         input_ids, attention_mask, labels = self._concatenate(batch)
 
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        del input_ids, attention_mask  # Free concatenated tensors
-        all_logps = get_batch_logps(logits, labels, self.label_pad_token_id)
-        del logits, labels
+        per_token_logps, loss_mask = forward_per_token_logps(
+            model, input_ids, attention_mask, labels, self.label_pad_token_id,
+            fused=self.fused, fused_chunk_size=self.fused_chunk_size,
+        )
+        del input_ids, attention_mask, labels  # Free concatenated tensors
+        all_logps = masked_avg_logps(per_token_logps, loss_mask)
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
