@@ -1454,6 +1454,83 @@ class TestRAFTMethod:
         assert loss.item() == 0.0
 
 
+class _RecordingRewardFn:
+    """3-arg reward that records the metadata each call received."""
+
+    def __init__(self):
+        self.metadata_calls = []
+
+    def __call__(self, prompts, completions, metadata):
+        self.metadata_calls.append(metadata)
+        return [float(len(c)) for c in completions]
+
+
+class TestMetadataPassthrough:
+    """batch["metadata"] reaches the reward, aligned to the B*G completions."""
+
+    def _batch(self, batch_size=2):
+        batch = _make_grpo_batch(batch_size=batch_size)
+        batch["metadata"] = [{"expected_stdout": f"out-{i}"} for i in range(batch_size)]
+        return batch
+
+    def _rollout(self, method_cls, batch, **kwargs):
+        torch.manual_seed(42)
+        reward = _RecordingRewardFn()
+        method = method_cls(
+            reward_fn=reward, tokenizer=MockTokenizer(),
+            max_new_tokens=4, **kwargs,
+        )
+        method._pad_token_id = 0
+        method.rollout(GenerativeModel(), batch)
+        return reward
+
+    def test_metadata_aligned_to_completions(self):
+        """Entry i of the reward's metadata is the dict of prompt i // G."""
+        reward = self._rollout(GRPOMethod, self._batch(batch_size=2),
+                               num_generations=3, beta=0.0)
+
+        assert len(reward.metadata_calls) == 1
+        meta = reward.metadata_calls[0]
+        assert [m["expected_stdout"] for m in meta] == ["out-0"] * 3 + ["out-1"] * 3
+
+    def test_flows_through_every_online_method(self):
+        """The passthrough lives in OnlineMethod._generate_and_score, so each
+        method sees it without any per-method code."""
+        ref_model = GenerativeModel()
+        ref_model.eval()
+        for method_cls, kwargs in (
+            (GRPOMethod, {"num_generations": 2, "beta": 0.0}),
+            (RLOOMethod, {"num_generations": 2, "beta": 0.0}),
+            (OnlineDPOMethod, {"num_generations": 2, "ref_model": ref_model}),
+            (RAFTMethod, {"num_generations": 2}),
+        ):
+            reward = self._rollout(method_cls, self._batch(batch_size=2), **kwargs)
+            assert len(reward.metadata_calls) == 1, method_cls.__name__
+            assert len(reward.metadata_calls[0]) == 4, method_cls.__name__  # B*G
+
+    def test_no_metadata_keeps_two_arg_call(self):
+        """A reward without a metadata parameter works on metadata-free batches."""
+        torch.manual_seed(42)
+        method = GRPOMethod(
+            reward_fn=_length_reward_fn, tokenizer=MockTokenizer(),
+            num_generations=2, beta=0.0, max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+        exp = method.rollout(GenerativeModel(), _make_grpo_batch(batch_size=2))
+        assert exp["advantages"].shape == (4,)
+
+    def test_metadata_with_two_arg_reward_raises(self):
+        """Opting into metadata_fields requires a 3-arg reward — fail loudly."""
+        torch.manual_seed(42)
+        method = GRPOMethod(
+            reward_fn=_length_reward_fn, tokenizer=MockTokenizer(),
+            num_generations=2, beta=0.0, max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+        with pytest.raises(TypeError):
+            method.rollout(GenerativeModel(), self._batch(batch_size=2))
+
+
 def _make_preference_dataset(n=4, vocab_size=32, chosen_len=8, rejected_len=8, prompt_len=2):
     """Create a list-of-dicts preference dataset for caching tests."""
     dataset = []

@@ -91,6 +91,12 @@ class OnlineMethod:
         prompt+completion sequences (prompt region and post-EOS padding masked
         in the labels), float32 ``rewards`` [B*G], and ``completion_length``.
         Rows are grouped by prompt: rows i*G..(i+1)*G-1 belong to prompt i.
+
+        When the batch carries ``metadata`` (a list of B dicts, from
+        ``tokenize_grpo(metadata_fields=...)`` via ``GRPOCollator``), the
+        reward is called as ``reward_fn(prompts, completions, metadata)`` with
+        the metadata aligned to the B*G completions — entry i is the metadata
+        dict of prompt i // G. Batches without metadata keep the 2-arg call.
         """
         input_ids = batch["input_ids"]  # [B, prompt_len], left-padded
         attention_mask = batch["attention_mask"]  # [B, prompt_len]
@@ -140,7 +146,14 @@ class OnlineMethod:
         prompt_texts = self.tokenizer.batch_decode(repeated_ids, skip_special_tokens=True)
         completion_texts = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         del repeated_ids, completion_ids
-        rewards = self.reward_fn(prompt_texts, completion_texts)  # list[float] or tensor
+        metadata = batch.get("metadata")
+        if metadata is not None:
+            # Completions are repeat_interleave(G) of the prompts, so
+            # completion i belongs to prompt i // G.
+            repeated_meta = [metadata[i // G] for i in range(len(completion_texts))]
+            rewards = self.reward_fn(prompt_texts, completion_texts, repeated_meta)
+        else:
+            rewards = self.reward_fn(prompt_texts, completion_texts)  # list[float] or tensor
         del prompt_texts, completion_texts
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.tensor(rewards, dtype=torch.float32, device=input_ids.device)

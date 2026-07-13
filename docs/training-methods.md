@@ -258,6 +258,25 @@ def reward_fn(prompts, completions):
     return [score_completion(p, c) for p, c in zip(prompts, completions)]
 ```
 
+**Per-row metadata (correctness rewards):** rewards often need more than the
+prompt text — an expected output, a test spec. Name dataset columns in
+`tokenize_grpo(metadata_fields=[...])` and they are carried through the
+collator to the reward, which is then called with a third argument: one
+metadata dict per completion, aligned to its prompt. Batches without metadata
+keep the 2-arg call, so existing rewards are unaffected.
+
+```python
+dataset = dataset.map(
+    lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512,
+                            metadata_fields=["expected_stdout"]),
+    remove_columns=dataset.column_names,
+)
+
+def reward_fn(prompts, completions, metadata):
+    return [1.0 if run(c) == m["expected_stdout"] else 0.0
+            for c, m in zip(completions, metadata)]
+```
+
 Which one?
 
 | Method | When to use |
