@@ -436,6 +436,27 @@ class TestGRPOCollator:
         assert batch["input_ids"].shape == (2, 3)
         assert (batch["attention_mask"] == 1).all()
 
+    def test_extra_keys_gathered_as_metadata(self):
+        """Non-tensor feature keys become batch["metadata"], one dict per row."""
+        collator = GRPOCollator(pad_token_id=0)
+        features = [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "expected_stdout": "a"},
+            {"input_ids": [3, 4], "attention_mask": [1, 1], "expected_stdout": None},
+        ]
+        batch = collator(features)
+
+        assert batch["metadata"] == [
+            {"expected_stdout": "a"},
+            {"expected_stdout": None},
+        ]
+
+    def test_no_extra_keys_no_metadata(self):
+        """Plain prompt-only features must not grow a metadata entry."""
+        collator = GRPOCollator(pad_token_id=0)
+        batch = collator([{"input_ids": [1, 2], "attention_mask": [1, 1]}])
+
+        assert "metadata" not in batch
+
 
 class TestTokenizeSFTTruncation:
     @pytest.fixture
@@ -582,3 +603,18 @@ class TestTokenizeGRPO:
         result = tokenize_grpo(example, mock_tokenizer, prompt_field="question")
 
         assert result["input_ids"] == [ord("A"), ord("B")]
+
+    def test_metadata_fields_copied_through(self, mock_tokenizer):
+        example = {"prompt": "AB", "expected_stdout": "42", "tests": ["t1"]}
+        result = tokenize_grpo(
+            example, mock_tokenizer, metadata_fields=["expected_stdout", "tests"],
+        )
+
+        assert result["expected_stdout"] == "42"
+        assert result["tests"] == ["t1"]
+
+    def test_no_metadata_fields_by_default(self, mock_tokenizer):
+        example = {"prompt": "AB", "expected_stdout": "42"}
+        result = tokenize_grpo(example, mock_tokenizer)
+
+        assert set(result) == {"input_ids", "attention_mask"}

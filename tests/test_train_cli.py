@@ -30,6 +30,15 @@ class TestRegistry:
         cls = registry.get_loss_class("orpo")
         assert cls.__name__ == "ORPOLoss"
 
+    def test_get_loss_class_online_methods(self):
+        for name, cls_name in [
+            ("grpo", "GRPOMethod"),
+            ("rloo", "RLOOMethod"),
+            ("online_dpo", "OnlineDPOMethod"),
+            ("raft", "RAFTMethod"),
+        ]:
+            assert registry.get_loss_class(name).__name__ == cls_name
+
     def test_get_loss_class_full_spec(self):
         cls = registry.get_loss_class("grimoire.losses.dpo:DPOLoss")
         assert cls.__name__ == "DPOLoss"
@@ -45,6 +54,10 @@ class TestRegistry:
     def test_get_tokenize_fn_preference(self):
         fn = registry.get_tokenize_fn("preference")
         assert fn.__name__ == "tokenize_preference"
+
+    def test_get_tokenize_fn_prompt_alias(self):
+        # "prompt" aliases the grpo tokenizer — all online methods share it
+        assert registry.get_tokenize_fn("prompt") is registry.get_tokenize_fn("grpo")
 
     def test_get_tokenize_fn_unknown(self):
         with pytest.raises(KeyError, match="unknown tokenize"):
