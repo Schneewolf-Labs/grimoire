@@ -8,10 +8,32 @@ def get_version():
     return version["__version__"]
 
 
+def get_long_description():
+    with open("README.md", encoding="utf-8") as f:
+        return f.read()
+
+
 setup(
     name="grimoire-rl",
     version=get_version(),
     description="Simple, multi-GPU LLM fine-tuning library",
+    long_description=get_long_description(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/Schneewolf-Labs/grimoire",
+    project_urls={
+        "Source": "https://github.com/Schneewolf-Labs/grimoire",
+        "Changelog": "https://github.com/Schneewolf-Labs/grimoire/blob/main/CHANGELOG.md",
+    },
+    license="MIT",
+    classifiers=[
+        "Development Status :: 5 - Production/Stable",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
     python_requires=">=3.10",
     packages=find_packages(include=["grimoire*"]),
     # NOTE: torch is intentionally excluded — it's version/CUDA-specific and

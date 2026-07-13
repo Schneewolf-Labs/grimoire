@@ -77,8 +77,14 @@ class OnlineDPOMethod(OnlineMethod):
         Returns ``input_ids`` / ``attention_mask`` / ``labels`` with the B
         chosen sequences stacked above the B rejected sequences (the same
         concatenated layout the offline preference losses forward in one
-        pass), plus ``ref_chosen_logps`` / ``ref_rejected_logps`` and
-        ``rollout_metrics``.
+        pass), plus ``ref_chosen_logps`` / ``ref_rejected_logps``, a per-pair
+        ``pair_mask``, and ``rollout_metrics``.
+
+        Groups where every completion scored the same produce a degenerate
+        pair — best and worst are reward-ties (possibly the very same row),
+        so the "preference" is arbitrary and training on it is pure noise.
+        Those pairs are masked out of the loss (``pair_mask`` 0); the
+        ``tied_pairs`` metric reports the masked fraction.
         """
         B = batch["input_ids"].size(0)
         G = self.num_generations
@@ -106,16 +112,21 @@ class OnlineDPOMethod(OnlineMethod):
 
         chosen_rewards = rewards_grouped.max(dim=1).values
         rejected_rewards = rewards_grouped.min(dim=1).values
+        # A reward-tied pair expresses no preference — mask it out of the loss
+        # rather than training toward an arbitrary ordering.
+        pair_mask = (chosen_rewards > rejected_rewards).float()  # [B]
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "ref_chosen_logps": ref_logps[:B],
             "ref_rejected_logps": ref_logps[B:],
+            "pair_mask": pair_mask,
             "rollout_metrics": {
                 "rewards_mean": rewards_grouped.mean().item(),
                 "rewards_std": rewards_grouped.std().item(),
                 "reward_margin": (chosen_rewards - rejected_rewards).mean().item(),
+                "tied_pairs": 1.0 - pair_mask.mean().item(),
                 "completion_length": float(input_ids.size(1) - batch["input_ids"].size(1)),
             },
         }
@@ -140,13 +151,18 @@ class OnlineDPOMethod(OnlineMethod):
 
         # DPO loss: -log sigmoid(beta * (pi_logratio - ref_logratio))
         # With label smoothing: -(1-eps)*logsigmoid(x) - eps*logsigmoid(-x)
+        # Reward-tied pairs carry no preference signal; average over the
+        # informative pairs only (pair_mask keeps the graph intact when a
+        # whole batch is tied).
         pi_logratios = chosen_logps - rejected_logps
         ref_logratios = ref_chosen_logps - ref_rejected_logps
         logits_diff = self.beta * (pi_logratios - ref_logratios)
-        loss = -(
+        pair_mask = batch["pair_mask"]
+        per_pair_loss = -(
             (1 - self.label_smoothing) * F.logsigmoid(logits_diff)
             + self.label_smoothing * F.logsigmoid(-logits_diff)
-        ).mean()
+        )
+        loss = (per_pair_loss * pair_mask).sum() / pair_mask.sum().clamp(min=1)
 
         # Implicit rewards: beta * (log pi(y|x) - log pi_ref(y|x)). Prefixed
         # "implicit" — the plain reward_* metrics are reward_fn scores from

@@ -1394,6 +1394,33 @@ class TestOnlineDPOMethod:
         loss, _ = method(model, _make_grpo_batch(), training=False)
         assert loss.item() == 0.0
 
+    def test_tied_pairs_masked_out(self):
+        """All-tied groups make degenerate pairs: masked, zero loss, grad intact."""
+        torch.manual_seed(42)
+        model, method = self._make_method(reward_fn=_constant_reward_fn)
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["pair_mask"].tolist() == [0.0, 0.0]
+        assert exp["rollout_metrics"]["tied_pairs"] == pytest.approx(1.0)
+
+        loss, _ = method(model, exp, training=True)
+        assert loss.item() == 0.0
+        assert loss.requires_grad  # backward() must still work on a tied batch
+
+    def test_informative_pairs_kept(self):
+        """Distinct rewards: nothing masked, normal DPO loss."""
+        torch.manual_seed(42)
+        model, method = self._make_method(
+            reward_fn=_increasing_reward_fn, num_generations=4,
+        )
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["pair_mask"].tolist() == [1.0, 1.0]
+        assert exp["rollout_metrics"]["tied_pairs"] == 0.0
+
+        loss, _ = method(model, exp, training=True)
+        assert loss.item() > 0
+
 
 class TestRAFTMethod:
     def _make_method(self, reward_fn=None, num_generations=4):
@@ -1452,6 +1479,51 @@ class TestRAFTMethod:
         model, method = self._make_method()
         loss, _ = method(model, _make_grpo_batch(), training=False)
         assert loss.item() == 0.0
+
+    def test_no_floor_keeps_every_winner(self):
+        """Default min_reward=None: all winners kept, no filter metric."""
+        torch.manual_seed(42)
+        model, method = self._make_method()
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["keep_mask"].tolist() == [1.0, 1.0]
+        assert "filtered_winners" not in exp["rollout_metrics"]
+
+    def _make_floored_method(self, min_reward):
+        method = RAFTMethod(
+            reward_fn=_increasing_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=4,
+            min_reward=min_reward,
+            max_new_tokens=4,
+        )
+        method._pad_token_id = 0
+        return GenerativeModel(), method
+
+    def test_min_reward_filters_bad_winners(self):
+        """A floor above every reward masks the whole batch: zero loss, grad intact."""
+        torch.manual_seed(42)
+        model, method = self._make_floored_method(min_reward=100.0)
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["keep_mask"].tolist() == [0.0, 0.0]
+        assert exp["rollout_metrics"]["filtered_winners"] == pytest.approx(1.0)
+
+        loss, _ = method(model, exp, training=True)
+        assert loss.item() == 0.0
+        assert loss.requires_grad  # backward() must still work when all filtered
+
+    def test_min_reward_keeps_qualifying_winners(self):
+        """Groups score [0..3] and [4..7]; a floor of 5 keeps only the second."""
+        torch.manual_seed(42)
+        model, method = self._make_floored_method(min_reward=5.0)
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
+
+        assert exp["keep_mask"].tolist() == [0.0, 1.0]
+        assert exp["rollout_metrics"]["filtered_winners"] == pytest.approx(0.5)
+
+        loss, _ = method(model, exp, training=True)
+        assert loss.item() > 0
 
 
 class _RecordingRewardFn:

@@ -357,6 +357,7 @@ Generates G completions per prompt (default 2), scores them, takes the highest- 
 - **Best for:** Preference-style alignment when you have a reward model or judge instead of a preference dataset
 - **Memory:** Very high (generation + reference + policy forwards)
 - **Key params:** `reward_fn`; `num_generations` (default 2, higher = best-of-G vs worst-of-G contrast); `beta` (default 0.1)
+- **Tied pairs:** groups where best == worst reward express no preference and are masked out of the loss; the `tied_pairs` metric reports the fraction
 - **Requires a reference policy:** `ref_model`, or a PEFT model (base weights via `disable_adapter()`)
 
 ```python
@@ -383,7 +384,7 @@ Reward-rAnked FineTuning (best-of-N rejection sampling). Generates G completions
 
 - **Best for:** A first online experiment, or when GRPO-style methods are unstable on your reward
 - **Memory:** High (generation + one forward pass per batch — no reference model)
-- **Key params:** `reward_fn`; `num_generations` (default 4) — higher = stronger selection pressure
+- **Key params:** `reward_fn`; `num_generations` (default 4) — higher = stronger selection pressure; `min_reward` (default None) — winners scoring below this floor are masked out of the loss, so the policy never imitates the best of a bad group (watch the `filtered_winners` metric)
 
 ```python
 from grimoire.losses import RAFTMethod
@@ -401,7 +402,7 @@ trainer = GrimoireTrainer(
 
 **Loss formula:**
 ```
-L_RAFT = L_SFT(argmax_reward completion per prompt)
+L_RAFT = L_SFT(argmax_reward completion per prompt, if reward >= min_reward)
 ```
 
 ## Quick Reference

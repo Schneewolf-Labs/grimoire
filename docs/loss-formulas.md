@@ -175,6 +175,7 @@ chosen       = argmax_g r(y_g),  rejected = argmin_g r(y_g)
 ```
 
 - Same math as offline DPO; the difference is that pairs are re-sampled from the current policy every step, so the preference signal never goes off-distribution
+- Reward-tied pairs (best == worst) are masked out of the loss — a tie expresses no preference
 - Requires a reference policy (`ref_model` or PEFT `disable_adapter()`)
 
 ## RAFT
@@ -188,6 +189,7 @@ L_RAFT = CrossEntropy on the argmax-reward completion's tokens (prompt masked)
 ```
 
 - Reward enters only through the argmax — no advantages, no KL, no reference model
+- Optional `min_reward` floor masks winners below it out of the loss (the best of a bad group is still bad)
 - The simplest online method; a strong baseline before GRPO/RLOO
 
 ## Comparison
