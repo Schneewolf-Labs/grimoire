@@ -30,7 +30,7 @@ grimoire/
 │   ├── kto.py         # KTO loss (unpaired binary feedback + reference model)
 │   ├── cpo.py         # CPO loss (reference-free + SFT + contrastive preference)
 │   ├── ipo.py         # IPO loss (squared loss variant of DPO + reference model)
-│   ├── grpo.py        # GRPO loss (group relative policy optimization)
+│   ├── grpo.py        # GRPOMethod — online RL (rollout + REINFORCE loss)
 │   └── reward.py      # Reward model loss (Bradley-Terry pairwise ranking)
 └── data/
     ├── common.py      # encode_prompt_response() — exact prompt masking
@@ -46,6 +46,7 @@ grimoire/
 - Uses `accelerate.Accelerator` directly for full control over the training loop
 - Loss functions are callables: `loss, metrics = loss_fn(model, batch, training=True)`
 - Loss functions own their data collators via `create_collator(pad_token_id)`
+- **Online methods add one optional hook, `rollout(model, batch)`.** The trainer calls it before the loss whenever `loss_fn` defines it, turning a prompt batch into a scored *experience* batch (generate → reward → advantages); the loss itself stays a pure function of that batch. Offline losses don't define `rollout`, so their path is unchanged. This is what lets GRPO live here without the loss secretly doing generation.
 - Multi-GPU, DeepSpeed, FSDP work out of the box via `accelerate config`
 - Gradient checkpointing with `use_reentrant=False` for DDP/FSDP compatibility
 - Single concatenated forward pass for ORPO/DPO/SimPO/CPO/IPO (chosen + rejected in one call)
@@ -55,7 +56,7 @@ grimoire/
 - KTO uses unpaired binary feedback with a frozen reference model (no chosen/rejected pairs needed)
 - CPO is reference-free like ORPO but uses a contrastive preference term instead of odds ratio (theoretically cleaner)
 - IPO replaces DPO's log-sigmoid with squared loss to prevent overfitting on noisy preference data
-- GRPO generates completions online, scores with a reward function, normalizes rewards within groups, and uses a REINFORCE objective with group-normalized advantages; one policy update per generation step (mu=1), so the importance ratio is 1 and clipping is inactive (kept for parity with the paper). Optional KL penalty (k3 estimator) against a frozen reference: `ref_model` if given, else the base model via `disable_adapter()` for PEFT. Prompts are LEFT-padded for generation. Requires ZeRO-2 or lower
+- `GRPOMethod` is the one online method: a two-phase `rollout()` + pure `__call__()`. `rollout()` generates G completions per prompt (unwrapped model, LEFT-padded prompts), scores them with a reward function, and normalizes rewards within groups into advantages (plus a frozen-reference pass for the KL term) — all under `no_grad`. `__call__()` then computes the REINFORCE loss from that experience batch, structurally like the offline losses. One policy update per generation step (mu=1), so the importance ratio is 1 and clipping is inactive (kept for parity with the paper). Optional KL penalty (k3 estimator) against a frozen reference: `ref_model` if given, else the base model via `disable_adapter()` for PEFT. Calls `model.generate()`, so it needs full weights — the trainer refuses ZeRO-3 (a runtime guard); ZeRO-2 or lower, or FSDP, is fine
 - RewardModelLoss trains a reward model with Bradley-Terry pairwise ranking (reuses preference data format)
 - NEFTune adds uniform noise to embeddings during SFT for improved chat quality (set `neftune_alpha` in config)
 - PackedSFTCollator bins multiple sequences into single rows to minimize padding waste (requires flash attention 2)
@@ -66,7 +67,7 @@ grimoire/
 
 ```python
 from grimoire import GrimoireTrainer, TrainingConfig
-from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOLoss, RewardModelLoss
+from grimoire.losses import SFTLoss, ORPOLoss, DPOLoss, SimPOLoss, KTOLoss, CPOLoss, IPOLoss, GRPOMethod, RewardModelLoss
 from grimoire.data import tokenize_sft, tokenize_preference, tokenize_kto, tokenize_grpo, PackedSFTCollator
 
 config = TrainingConfig(
@@ -135,14 +136,16 @@ trainer = GrimoireTrainer(
 )
 trainer.train()
 
-# GRPO — online RL with a reward function (no pre-labeled data needed)
+# GRPO — online RL with a reward function (no pre-labeled data needed).
+# GRPOMethod defines rollout(); the trainer calls it each step to generate and
+# score completions before the loss. Nothing else about the call changes.
 grpo_dataset = dataset.map(
     lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512),
     remove_columns=dataset.column_names,
 )
 trainer = GrimoireTrainer(
     model=model, tokenizer=tokenizer, config=config,
-    loss_fn=GRPOLoss(
+    loss_fn=GRPOMethod(
         reward_fn=my_reward_fn,  # callable: (prompts, completions) -> list[float]
         tokenizer=tokenizer,
         num_generations=4,
@@ -281,7 +284,10 @@ pi_ref     = reference model (frozen copy of initial weights)
 beta       = scaling factor (default 0.1, controls target margin 1/(2*beta))
 ```
 
-## GRPO Loss Formula
+## GRPO Formula
+
+The `rollout` phase produces `advantages` and `ref_logps`; the loss phase (below)
+consumes them. `r` (rewards) and the group normalization happen in `rollout`.
 
 ```
 L_GRPO = -mean(advantages * min(ratio, clipped_ratio)) + beta * KL
@@ -320,8 +326,8 @@ Grimoire is a standalone library that Merlina imports. Merlina handles:
 - Hub upload
 
 Grimoire handles:
-- The training loop
-- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, GRPO, Reward Model)
+- The training loop (offline losses, plus online methods via the `rollout` hook)
+- Loss computation (SFT, ORPO, DPO, SimPO, KTO, CPO, IPO, Reward Model) and the online GRPO method
 - Data collation and tokenization
 - Checkpointing and logging
 - Multi-GPU orchestration

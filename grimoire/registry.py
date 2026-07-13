@@ -19,7 +19,7 @@ LOSSES: dict[str, str] = {
     "kto":    "grimoire.losses.kto:KTOLoss",
     "cpo":    "grimoire.losses.cpo:CPOLoss",
     "ipo":    "grimoire.losses.ipo:IPOLoss",
-    "grpo":   "grimoire.losses.grpo:GRPOLoss",
+    "grpo":   "grimoire.losses.grpo:GRPOMethod",
     "reward": "grimoire.losses.reward:RewardModelLoss",
 }
 

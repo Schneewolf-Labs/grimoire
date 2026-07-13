@@ -14,7 +14,7 @@ from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
-from grimoire.losses.grpo import GRPOLoss
+from grimoire.losses.grpo import GRPOMethod
 from grimoire.losses.reward import RewardModelLoss
 from grimoire.data.cache import cache_reference_log_probs
 
@@ -976,28 +976,32 @@ def _length_reward_fn(prompts, completions):
     return [float(len(c)) for c in completions]
 
 
-class TestGRPOLoss:
-    def _make_loss(self, reward_fn=None, num_generations=2, beta=0.04, max_new_tokens=4):
+class TestGRPOMethod:
+    def _make_method(self, reward_fn=None, num_generations=2, beta=0.04, max_new_tokens=4):
         model = GenerativeModel()
         tokenizer = MockTokenizer()
         if reward_fn is None:
             reward_fn = _length_reward_fn
-        loss_fn = GRPOLoss(
+        method = GRPOMethod(
             reward_fn=reward_fn,
             tokenizer=tokenizer,
             num_generations=num_generations,
             beta=beta,
             max_new_tokens=max_new_tokens,
         )
-        loss_fn._pad_token_id = 0
-        return model, loss_fn
+        method._pad_token_id = 0
+        return model, method
+
+    @staticmethod
+    def _step(model, method, batch):
+        """Drive the full two-phase step: rollout (online) then loss (pure)."""
+        experience = method.rollout(model, batch)
+        return method(model, experience, training=True)
 
     def test_returns_scalar_loss_and_metrics(self):
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        loss, metrics = loss_fn(model, batch, training=True)
+        model, method = self._make_method()
+        loss, metrics = self._step(model, method, _make_grpo_batch())
 
         assert loss.dim() == 0
         assert isinstance(metrics, dict)
@@ -1011,92 +1015,91 @@ class TestGRPOLoss:
 
     def test_loss_is_finite(self):
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        loss, _ = loss_fn(model, batch, training=True)
+        model, method = self._make_method()
+        loss, _ = self._step(model, method, _make_grpo_batch())
 
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
 
-    def test_eval_returns_zero_loss(self):
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
+    def test_rollout_returns_experience_batch(self):
+        """rollout() turns a prompt-only batch into a scored experience batch."""
+        torch.manual_seed(42)
+        model, method = self._make_method(num_generations=2)
+        exp = method.rollout(model, _make_grpo_batch(batch_size=2))
 
-        loss, metrics = loss_fn(model, batch, training=False)
+        # One row per (prompt, generation): B=2 * G=2 = 4
+        assert exp["input_ids"].size(0) == 4
+        assert exp["advantages"].shape == (4,)
+        for key in ("input_ids", "attention_mask", "labels"):
+            assert exp[key].shape == exp["input_ids"].shape
+        assert not exp["advantages"].requires_grad  # rollout runs under no_grad
+
+    def test_eval_returns_zero_loss(self):
+        """Eval is not meaningful for GRPO; __call__ short-circuits to zero and
+        never touches the (prompt-only) eval batch beyond its device."""
+        model, method = self._make_method()
+        loss, metrics = method(model, _make_grpo_batch(), training=False)
         assert loss.item() == 0.0
         assert isinstance(metrics, dict)
 
     def test_num_generations_affects_batch(self):
-        """More generations should still produce valid loss."""
+        """More generations should still produce a valid loss."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss(num_generations=4)
-        batch = _make_grpo_batch(batch_size=2)
-
-        loss, metrics = loss_fn(model, batch, training=True)
+        model, method = self._make_method(num_generations=4)
+        loss, _ = self._step(model, method, _make_grpo_batch(batch_size=2))
 
         assert loss.dim() == 0
         assert not torch.isnan(loss)
 
     def test_beta_zero_removes_kl(self):
-        """With beta=0, KL penalty should not contribute to loss."""
+        """With beta=0, the KL penalty should not contribute to the loss."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss(beta=0.0)
-        batch = _make_grpo_batch()
-
-        loss, metrics = loss_fn(model, batch, training=True)
+        model, method = self._make_method(beta=0.0)
+        loss, _ = self._step(model, method, _make_grpo_batch())
 
         assert loss.dim() == 0
         assert not torch.isnan(loss)
 
     def test_constant_rewards_zero_advantages(self):
-        """When all rewards are identical, advantages should be zero."""
+        """When all rewards are identical, advantages should be ~zero."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss(reward_fn=_constant_reward_fn)
-        batch = _make_grpo_batch()
-
-        _, metrics = loss_fn(model, batch, training=True)
+        model, method = self._make_method(reward_fn=_constant_reward_fn)
+        _, metrics = self._step(model, method, _make_grpo_batch())
 
         # With constant rewards, std is 0 but clamped, so advantages ~ 0
         assert abs(metrics["advantages_mean"]) < 1e-6
 
     def test_creates_correct_collator(self):
-        _, loss_fn = self._make_loss()
+        _, method = self._make_method()
         from grimoire.data.grpo import GRPOCollator
-        collator = loss_fn.create_collator(pad_token_id=0)
+        collator = method.create_collator(pad_token_id=0)
         assert isinstance(collator, GRPOCollator)
 
     def test_loss_requires_grad(self):
-        """Loss should have gradients flowing through policy log-probs."""
+        """The loss must carry gradients through the policy log-probs, even
+        though the experience batch from rollout() is detached."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
-
-        loss, _ = loss_fn(model, batch, training=True)
+        model, method = self._make_method()
+        loss, _ = self._step(model, method, _make_grpo_batch())
 
         assert loss.requires_grad
 
     def test_ratio_starts_near_one(self):
-        """On first call, old and new policy are the same, so ratio ~ 1."""
+        """pi_old == pi on a single update, so the ratio ~ 1."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
-        batch = _make_grpo_batch()
+        model, method = self._make_method()
+        _, metrics = self._step(model, method, _make_grpo_batch())
 
-        _, metrics = loss_fn(model, batch, training=True)
-
-        # ratio = exp(logps - old_logps), should be ~1 since same model
         assert abs(metrics["ratio_mean"] - 1.0) < 0.1
 
     def test_kl_with_ref_model(self):
         """KL (k3 estimator) against a different reference model is non-negative."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss()
+        model, method = self._make_method()
         ref_model = GenerativeModel()
         ref_model.eval()
-        loss_fn.ref_model = ref_model
-        batch = _make_grpo_batch()
-
-        loss, metrics = loss_fn(model, batch, training=True)
+        method.ref_model = ref_model
+        loss, metrics = self._step(model, method, _make_grpo_batch())
 
         assert metrics["kl"] >= 0.0
         assert not torch.isnan(loss)
@@ -1104,16 +1107,14 @@ class TestGRPOLoss:
     def test_no_ref_model_skips_kl(self):
         """With beta > 0 but no reference policy, the KL term is skipped."""
         torch.manual_seed(42)
-        model, loss_fn = self._make_loss(beta=0.04)
-        batch = _make_grpo_batch()
-
-        _, metrics = loss_fn(model, batch, training=True)
+        model, method = self._make_method(beta=0.04)
+        _, metrics = self._step(model, method, _make_grpo_batch())
 
         assert metrics["kl"] == 0.0
 
     def test_ref_model_must_be_eval(self):
         with pytest.raises(ValueError):
-            GRPOLoss(
+            GRPOMethod(
                 reward_fn=_constant_reward_fn,
                 tokenizer=MockTokenizer(),
                 ref_model=GenerativeModel(),  # still in training mode
@@ -1121,14 +1122,14 @@ class TestGRPOLoss:
 
     def test_completion_mask_stops_after_eos(self):
         """Tokens after the first EOS are masked out (generate() pads there)."""
-        _, loss_fn = self._make_loss()
-        loss_fn.tokenizer.eos_token_id = 7
+        _, method = self._make_method()
+        method.tokenizer.eos_token_id = 7
         completion_ids = torch.tensor([
             [3, 7, 9, 9],  # EOS at index 1 → mask includes EOS, excludes rest
             [3, 4, 5, 6],  # no EOS → all real
         ])
 
-        mask = loss_fn._completion_mask(completion_ids)
+        mask = method._completion_mask(completion_ids)
 
         assert mask.tolist() == [[1, 1, 0, 0], [1, 1, 1, 1]]
 
@@ -1540,7 +1541,7 @@ class TestReferenceForwardOrdering:
         self._tag(model, "policy", calls)
         self._tag(ref_model, "ref", calls)
 
-        loss_fn = GRPOLoss(
+        method = GRPOMethod(
             reward_fn=_length_reward_fn,
             tokenizer=MockTokenizer(),
             num_generations=2,
@@ -1548,11 +1549,12 @@ class TestReferenceForwardOrdering:
             max_new_tokens=4,
             ref_model=ref_model,
         )
-        loss_fn._pad_token_id = 0
-        loss, _ = loss_fn(model, _make_grpo_batch(), training=True)
+        method._pad_token_id = 0
+        # rollout does generation (policy forwards) then the frozen ref pass;
+        # the loss phase does the single graded policy forward last.
+        experience = method.rollout(model, _make_grpo_batch())
+        loss, _ = method(model, experience, training=True)
 
-        # Generation produces a run of policy forwards; the scoring pass must
-        # be the single policy forward AFTER the reference pass.
         assert "ref" in calls
         assert calls.index("ref") == len(calls) - 2
         assert calls[-1] == "policy"
@@ -1561,18 +1563,18 @@ class TestReferenceForwardOrdering:
 
 class TestGRPOGenerationCache:
     def test_generate_uses_kv_cache(self):
-        """GRPOLoss must explicitly request use_cache=True: the trainer sets
+        """rollout() must explicitly request use_cache=True: the trainer sets
         model.config.use_cache = False for training, and cache-less generation
         recomputes the whole prefix per token."""
         torch.manual_seed(0)
         model = GenerativeModel()
-        loss_fn = GRPOLoss(
+        method = GRPOMethod(
             reward_fn=_constant_reward_fn,
             tokenizer=MockTokenizer(),
             num_generations=2,
             beta=0.0,
             max_new_tokens=4,
         )
-        loss_fn._pad_token_id = 0
-        loss_fn(model, _make_grpo_batch(), training=True)
+        method._pad_token_id = 0
+        method.rollout(model, _make_grpo_batch())
         assert model.last_generate_use_cache is True

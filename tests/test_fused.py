@@ -22,7 +22,7 @@ from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
 from grimoire.losses.ipo import IPOLoss
-from grimoire.losses.grpo import GRPOLoss
+from grimoire.losses.grpo import GRPOMethod
 from grimoire.losses.utils import _fused_logits_kwarg, forward_per_token_logps
 
 from .test_losses import (
@@ -343,24 +343,27 @@ class TestFusedParity:
         _run_pair(KTOLoss, model, batch, ref_model=ref_model, beta=0.1)
 
     def test_grpo(self):
+        torch.manual_seed(0)
         model = HFStyleGenerativeModel()
-        batch = _make_grpo_batch()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        method = GRPOMethod(
+            reward_fn=_length_reward_fn,
+            tokenizer=MockTokenizer(),
+            num_generations=2,
+            beta=0.04,
+            max_new_tokens=4,
+            ref_model=ref_model,
+        )
+        method._pad_token_id = 0
+        # One rollout -> a fixed experience batch; the loss phase must produce
+        # identical loss/metrics/grads whether the policy log-probs go through
+        # the fused or the full-logits path.
+        experience = method.rollout(model, _make_grpo_batch())
         results = []
         for fused in (True, False):
-            loss_fn = GRPOLoss(
-                reward_fn=_length_reward_fn,
-                tokenizer=MockTokenizer(),
-                num_generations=2,
-                beta=0.04,
-                max_new_tokens=4,
-                fused=fused,
-            )
-            loss_fn._pad_token_id = 0
-            ref_model = copy.deepcopy(model)
-            ref_model.eval()
-            loss_fn.ref_model = ref_model
-            torch.manual_seed(7)  # identical sampled completions for both runs
-            loss, metrics = loss_fn(model, batch, training=True)
+            method.fused = fused
+            loss, metrics = method(model, experience, training=True)
             results.append((loss, metrics, _grads(model, loss)))
         (lf, mf, gf), (lu, mu, gu) = results
         _assert_parity(lf, mf, lu, mu, gf, gu)

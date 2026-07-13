@@ -577,6 +577,7 @@ class GrimoireTrainer:
         # unrelated operations (flash-attn, cuBLAS, etc.), making them
         # extremely hard to diagnose.
         self._validate_token_ids()
+        self._check_rollout_compat()
 
         self._log_info("***** Starting training *****")
         self._log_info(f"  Num examples = {len(self.train_dataloader.dataset)}")
@@ -629,6 +630,12 @@ class GrimoireTrainer:
 
             for step, batch in enumerate(active_dataloader):
                 with self.accelerator.accumulate(self.model):
+                    # Online methods (e.g. GRPO) turn a prompt-only batch into a
+                    # scored experience batch (generate + reward + advantages)
+                    # before the loss. Offline losses don't define rollout() and
+                    # the batch passes straight through unchanged.
+                    if hasattr(self.loss_fn, "rollout"):
+                        batch = self.loss_fn.rollout(self.model, batch)
                     loss, metrics = self.loss_fn(self.model, batch, training=True)
                     del batch  # Free input tensors before backward
                     self.accelerator.backward(loss)
@@ -936,6 +943,24 @@ class GrimoireTrainer:
             return output
 
         return embeddings.register_forward_hook(neftune_forward_hook)
+
+    def _check_rollout_compat(self):
+        """Guard incompatible distributed setups for online (rollout) methods.
+
+        A method that exposes rollout() calls model.generate(), which needs full
+        model weights — impossible under DeepSpeed ZeRO-3, where parameters are
+        partitioned across ranks. Fail loudly here rather than deadlocking or
+        producing garbage generations mid-run. Offline losses are unaffected.
+        """
+        if not hasattr(self.loss_fn, "rollout"):
+            return
+        plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if plugin is not None and getattr(plugin, "zero_stage", None) == 3:
+            raise RuntimeError(
+                f"{type(self.loss_fn).__name__} runs an online rollout phase "
+                "(model.generate()), which needs full weight access and is "
+                "incompatible with DeepSpeed ZeRO-3. Use ZeRO-2 or lower, or FSDP."
+            )
 
     def _validate_token_ids(self):
         """Check that dataset token IDs fit within the model's embedding table.

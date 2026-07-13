@@ -60,6 +60,44 @@ def __call__(self, model, batch, training=True):
     # Full training loss below...
 ```
 
+## Online Methods: the `rollout` Hook
+
+Most methods are **offline** — a pure function of `(model, batch)` where `batch`
+comes straight from a fixed dataset. Some methods are **online**: they need to
+*generate* completions during training and score them against a reward function
+or environment (GRPO is the built-in example). For those, define an optional
+`rollout(model, batch)` method:
+
+```python
+class MyOnlineMethod:
+    @torch.no_grad()
+    def rollout(self, model, batch):
+        # batch is prompt-only. Generate, score, compute advantages —
+        # all the "environment interaction". No gradients here.
+        experience = ...  # dict with input_ids/attention_mask/labels + your extras
+        return experience
+
+    def __call__(self, model, batch, training=True):
+        # `batch` here is the experience dict rollout() returned.
+        # Pure loss, exactly like an offline loss.
+        ...
+```
+
+The trainer calls `rollout` before the loss on every step **only if the method
+defines it** — offline losses omit it and their path is untouched. This keeps
+the loss phase pure (no generation, no tokenizer, no reward calls hidden inside
+`__call__`) while sharing the entire training loop, checkpointing, and
+multi-GPU machinery.
+
+Two constraints come with generating during training:
+
+- **Distributed strategy:** `model.generate()` needs whole weights, so online
+  methods can't run under DeepSpeed ZeRO-3. The trainer checks this at startup
+  and raises a clear error; ZeRO-2 or lower, or FSDP, is fine.
+- **Model unwrapping:** generation needs the unwrapped model (DDP/FSDP wrappers
+  don't forward `.generate()`), while the loss forward wants the wrapped one for
+  gradient sync. Unwrap inside `rollout` (see `GRPOMethod` for the pattern).
+
 ## Metrics
 
 The metrics dict you return gets:
