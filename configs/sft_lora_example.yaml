@@ -20,6 +20,10 @@ model:
 #   bnb_4bit_compute_dtype: "bfloat16"
 #   bnb_4bit_quant_type: "nf4"
 #   bnb_4bit_use_double_quant: true
+#
+# By default only 1-D params (norms, biases) are upcast to fp32; embeddings
+# and lm_head stay in half precision (bitsandbytes never quantizes them).
+# Add `kbit_upcast: "all"` under `training:` for peft's full fp32 upcast.
 
 dataset:
   name: "HuggingFaceH4/ultrachat_200k"

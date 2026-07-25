@@ -28,6 +28,12 @@ class TrainingConfig:
     lr_scheduler: str = "cosine"  # "linear", "cosine", "constant", "constant_with_warmup"
     disable_dropout: bool = False
     use_liger: bool = False  # Patch model with Liger Kernel fused ops (RMSNorm, RoPE, SwiGLU)
+    # QLoRA: which non-quantized params of a 4-bit/8-bit model to upcast to fp32
+    # before LoRA. "norms" upcasts only 1-D params (RMSNorm/LayerNorm weights,
+    # biases); embeddings and lm_head keep their loaded half precision — several
+    # GB saved on 128k+-vocab models. "all" is peft's prepare_model_for_kbit_training
+    # behavior (everything fp32). "none" skips the upcast entirely.
+    kbit_upcast: str = "norms"  # "norms", "all", "none"
 
     # Regularization
     neftune_alpha: Optional[float] = None  # NEFTune noise scale (e.g. 5.0); None = disabled
