@@ -1738,3 +1738,105 @@ class TestGRPORolloutHook:
         """Offline losses must not expose rollout() — the trainer skips the hook."""
         assert not hasattr(SFTLoss(), "rollout")
         assert not hasattr(DPOLoss(ref_model=TinyLM().eval()), "rollout")
+
+
+class TestKbitPrepare:
+    """Selective fp32 upcast for quantized (QLoRA) models.
+
+    bitsandbytes never quantizes embeddings or lm_head; peft's
+    prepare_model_for_kbit_training upcasts them to fp32, doubling their
+    footprint. kbit_upcast='norms' (default) must keep 2-D params in half
+    precision and upcast only the tiny 1-D norm/bias params.
+    """
+
+    @staticmethod
+    def _fake_4bit_model():
+        model = TinyLM().to(torch.bfloat16)
+        model.is_loaded_in_4bit = True
+        return model
+
+    def test_norms_keeps_embeddings_and_head_in_half_precision(self):
+        model = self._fake_4bit_model()
+        config = TrainingConfig(kbit_upcast="norms", gradient_checkpointing=False)
+        model = GrimoireTrainer._prepare_kbit_model(model, config)
+
+        assert model.embed.weight.dtype == torch.bfloat16
+        assert model.head.weight.dtype == torch.bfloat16
+        assert model.layers[0].weight.dtype == torch.bfloat16
+        # 1-D params (biases here; norm weights in real models) go to fp32
+        assert model.head.bias.dtype == torch.float32
+        assert model.layers[0].bias.dtype == torch.float32
+        # base model is frozen, same as peft's prep
+        assert all(not p.requires_grad for p in model.parameters())
+
+    def test_all_upcasts_everything_via_peft(self):
+        model = self._fake_4bit_model()
+        config = TrainingConfig(kbit_upcast="all", gradient_checkpointing=False)
+        model = GrimoireTrainer._prepare_kbit_model(model, config)
+
+        assert all(p.dtype == torch.float32 for p in model.parameters())
+        assert all(not p.requires_grad for p in model.parameters())
+
+    def test_none_skips_upcast(self):
+        model = self._fake_4bit_model()
+        config = TrainingConfig(kbit_upcast="none", gradient_checkpointing=False)
+        model = GrimoireTrainer._prepare_kbit_model(model, config)
+
+        assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+        assert all(not p.requires_grad for p in model.parameters())
+
+    def test_unknown_value_raises(self):
+        model = self._fake_4bit_model()
+        config = TrainingConfig(kbit_upcast="everything", gradient_checkpointing=False)
+        with pytest.raises(ValueError, match="kbit_upcast"):
+            GrimoireTrainer._prepare_kbit_model(model, config)
+
+    def test_non_quantized_model_never_touched(self):
+        """The prep only runs for models flagged 4-bit/8-bit by transformers."""
+        model = TinyLM().to(torch.bfloat16)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from peft import LoraConfig
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=TrainingConfig(
+                    output_dir=tmpdir, mixed_precision="no",
+                    gradient_checkpointing=False, save_on_epoch_end=False,
+                ),
+                loss_fn=SFTLoss(),
+                train_dataset=make_sft_dataset(n=4),
+                peft_config=LoraConfig(target_modules=["layers.0"]),
+            )
+            base = trainer.accelerator.unwrap_model(trainer.model).get_base_model()
+            # no kbit prep ran: 1-D params still bf16
+            assert base.head.bias.dtype == torch.bfloat16
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_fake_quantized_model_routes_through_prep(self):
+        model = self._fake_4bit_model()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            from peft import LoraConfig
+
+            trainer = GrimoireTrainer(
+                model=model,
+                tokenizer=FakeTokenizer(),
+                config=TrainingConfig(
+                    output_dir=tmpdir, mixed_precision="no",
+                    gradient_checkpointing=False, save_on_epoch_end=False,
+                ),
+                loss_fn=SFTLoss(),
+                train_dataset=make_sft_dataset(n=4),
+                peft_config=LoraConfig(target_modules=["layers.0"]),
+            )
+            base = trainer.accelerator.unwrap_model(trainer.model).get_base_model()
+            # kbit prep ran with the default "norms": embeddings/head stay
+            # bf16, 1-D params upcast to fp32
+            assert base.embed.weight.dtype == torch.bfloat16
+            assert base.head.weight.dtype == torch.bfloat16
+            assert base.head.bias.dtype == torch.float32
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)

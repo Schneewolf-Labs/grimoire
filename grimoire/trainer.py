@@ -411,18 +411,10 @@ class GrimoireTrainer:
 
         # Apply PEFT / LoRA
         if peft_config is not None:
-            from peft import get_peft_model, prepare_model_for_kbit_training
+            from peft import get_peft_model
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-                # use_reentrant=False is required for flash attention backward.
-                # The interaction between gradient checkpointing +
-                # torch.no_grad() + quantized weights is handled by
-                # _disable_grad_checkpointing() in the loss functions.
-                model = prepare_model_for_kbit_training(
-                    model,
-                    use_gradient_checkpointing=config.gradient_checkpointing,
-                    gradient_checkpointing_kwargs={"use_reentrant": False},
-                )
+                model = self._prepare_kbit_model(model, config)
             model = get_peft_model(model, peft_config)
             if hasattr(model, "print_trainable_parameters"):
                 model.print_trainable_parameters()
@@ -925,6 +917,70 @@ class GrimoireTrainer:
             cross_entropy=False,
             fused_linear_cross_entropy=False,
         )
+
+    @staticmethod
+    def _prepare_kbit_model(model, config):
+        """Prepare a bitsandbytes-quantized model for LoRA training.
+
+        peft's ``prepare_model_for_kbit_training`` upcasts EVERY non-quantized
+        fp16/bf16 parameter to fp32 — including ``embed_tokens`` and ``lm_head``,
+        which bitsandbytes never quantizes.  On 128k+-vocab models that is
+        roughly 1B params doubled to fp32 (~4 GB of extra VRAM), which makes
+        4-bit QLoRA look like the full weights are still resident.
+
+        ``config.kbit_upcast`` controls the behavior:
+          - "norms" (default): upcast only 1-D params (RMSNorm/LayerNorm
+            weights, biases) — the ones that matter for numerical stability
+            and cost ~nothing.  Embeddings and lm_head keep their loaded
+            half precision.
+          - "all": delegate to peft's prepare_model_for_kbit_training
+            (the old behavior).
+          - "none": no upcast at all.
+
+        Gradient checkpointing is NOT enabled here — the trainer enables it
+        on the PEFT-wrapped model right after this (use_reentrant=False, plus
+        enable_input_require_grads), matching what peft's prep would do.
+        """
+        upcast = config.kbit_upcast
+        if upcast not in ("norms", "all", "none"):
+            raise ValueError(
+                f"Unknown kbit_upcast: {upcast!r}. Choose from: norms, all, none"
+            )
+
+        if upcast == "all":
+            from peft import prepare_model_for_kbit_training
+
+            # use_reentrant=False is required for flash attention backward.
+            # The interaction between gradient checkpointing +
+            # torch.no_grad() + quantized weights is handled by
+            # _disable_grad_checkpointing() in the loss functions.
+            return prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=config.gradient_checkpointing,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+
+        for param in model.parameters():
+            param.requires_grad = False
+
+        if upcast == "norms":
+            upcast_numel = 0
+            kept_numel = 0
+            for param in model.parameters():
+                if param.dtype not in (torch.float16, torch.bfloat16):
+                    continue
+                if param.ndim <= 1:
+                    param.data = param.data.to(torch.float32)
+                    upcast_numel += param.numel()
+                else:
+                    kept_numel += param.numel()
+            logger.info(
+                "kbit prep: upcast %.2fM norm/bias params to fp32; kept %.2fM "
+                "params (embeddings/lm_head) in half precision. Set "
+                "kbit_upcast='all' for peft's full fp32 upcast.",
+                upcast_numel / 1e6, kept_numel / 1e6,
+            )
+        return model
 
     def _register_neftune_hook(self, alpha):
         """Register a forward hook that adds uniform noise to embeddings during training.

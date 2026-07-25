@@ -6,5 +6,12 @@ build-backend = "setuptools.build_meta"
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.lint]
+# Pin the pre-ruff-0.16 default rule set. ruff 0.16.0 expanded its defaults
+# (isort, pyupgrade, bugbear, ...) and CI installs an unpinned ruff, which
+# turned the new rules on overnight. Opt into stricter rules deliberately,
+# not via a floating dependency.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -92,7 +92,7 @@ trainer.train()
 
 ### With LoRA
 
-Pass a `peft_config` and Grimoire handles the rest — including `prepare_model_for_kbit_training` for quantized models.
+Pass a `peft_config` and Grimoire handles the rest — including kbit preparation for quantized (QLoRA) models. By default only the tiny 1-D params (norm weights, biases) are upcast to fp32; embeddings and `lm_head` — which bitsandbytes never quantizes — keep their loaded half precision, saving several GB of VRAM on large-vocab models versus peft's `prepare_model_for_kbit_training` (restore that behavior with `TrainingConfig(kbit_upcast="all")`).
 
 ```python
 from peft import LoraConfig
@@ -208,6 +208,7 @@ Available hooks: `on_train_begin`, `on_train_end`, `on_epoch_begin`, `on_epoch_e
 | `optimizer` | `"adamw"` | See supported optimizers below |
 | `lr_scheduler` | `"cosine"` | `"linear"`, `"cosine"`, `"constant"`, `"constant_with_warmup"` |
 | `disable_dropout` | `False` | Set `True` for ORPO/DPO |
+| `kbit_upcast` | `"norms"` | QLoRA fp32 upcast: `"norms"` (1-D params only — embeddings/`lm_head` stay half precision), `"all"` (peft's full upcast), `"none"` |
 | `logging_steps` | `10` | Log metrics every N steps |
 | `eval_steps` | `None` | Evaluate every N steps |
 | `save_steps` | `None` | Checkpoint every N steps |
