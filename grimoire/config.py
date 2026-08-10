@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 
 @dataclass
@@ -30,7 +29,7 @@ class TrainingConfig:
     use_liger: bool = False  # Patch model with Liger Kernel fused ops (RMSNorm, RoPE, SwiGLU)
 
     # Regularization
-    neftune_alpha: Optional[float] = None  # NEFTune noise scale (e.g. 5.0); None = disabled
+    neftune_alpha: float | None = None  # NEFTune noise scale (e.g. 5.0); None = disabled
 
     # Data loading
     dataloader_num_workers: int = 0
@@ -38,22 +37,22 @@ class TrainingConfig:
 
     # Logging
     logging_steps: int = 10
-    log_with: Optional[str] = None  # "wandb" or None
-    project_name: Optional[str] = None
-    run_name: Optional[str] = None
-    wandb_tags: List[str] = field(default_factory=list)
-    wandb_notes: Optional[str] = None
+    log_with: str | None = None  # "wandb" or None
+    project_name: str | None = None
+    run_name: str | None = None
+    wandb_tags: list[str] = field(default_factory=list)
+    wandb_notes: str | None = None
 
     # Evaluation
-    eval_steps: Optional[int] = None
+    eval_steps: int | None = None
     eval_on_start: bool = False
-    eval_batch_size: Optional[int] = None  # falls back to batch_size if None
+    eval_batch_size: int | None = None  # falls back to batch_size if None
 
     # Checkpointing
-    save_steps: Optional[int] = None
+    save_steps: int | None = None
     save_total_limit: int = 2
     save_on_epoch_end: bool = True
-    resume_from_checkpoint: Optional[str] = None
+    resume_from_checkpoint: str | None = None
 
     # Reproducibility
     seed: int = 42

@@ -6,21 +6,23 @@ from contextlib import contextmanager
 
 import pytest
 import torch
-import torch.nn as nn
-from grimoire.losses.sft import SFTLoss
-from grimoire.losses.orpo import ORPOLoss
-from grimoire.losses.utils import pad_dim1 as _pad_dim1, _disable_grad_checkpointing
-from grimoire.losses.dpo import DPOLoss
-from grimoire.losses.simpo import SimPOLoss
-from grimoire.losses.kto import KTOLoss
+from torch import nn
+
+from grimoire.data.cache import cache_reference_log_probs
 from grimoire.losses.cpo import CPOLoss
-from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.grpo import GRPOMethod
-from grimoire.losses.rloo import RLOOMethod
+from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.kto import KTOLoss
 from grimoire.losses.online_dpo import OnlineDPOMethod
+from grimoire.losses.orpo import ORPOLoss
 from grimoire.losses.raft import RAFTMethod
 from grimoire.losses.reward import RewardModelLoss
-from grimoire.data.cache import cache_reference_log_probs
+from grimoire.losses.rloo import RLOOMethod
+from grimoire.losses.sft import SFTLoss
+from grimoire.losses.simpo import SimPOLoss
+from grimoire.losses.utils import _disable_grad_checkpointing
+from grimoire.losses.utils import pad_dim1 as _pad_dim1
 
 
 class SimpleModel(nn.Module):
@@ -1844,9 +1846,8 @@ class TestDisableGradCheckpointing:
                 self.is_gradient_checkpointing = True
 
         model = FakeModel()
-        with pytest.raises(RuntimeError):
-            with _disable_grad_checkpointing(model):
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), _disable_grad_checkpointing(model):
+            raise RuntimeError("boom")
 
         assert model.is_gradient_checkpointing
 

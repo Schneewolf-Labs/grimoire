@@ -1,10 +1,11 @@
 """Tests for data collators and tokenization utilities."""
 
 import pytest
-from grimoire.data.sft import SFTCollator, PackedSFTCollator, tokenize_sft
-from grimoire.data.preference import PreferenceCollator, tokenize_preference
-from grimoire.data.kto import KTOCollator, tokenize_kto
+
 from grimoire.data.grpo import GRPOCollator, tokenize_grpo
+from grimoire.data.kto import KTOCollator, tokenize_kto
+from grimoire.data.preference import PreferenceCollator, tokenize_preference
+from grimoire.data.sft import PackedSFTCollator, SFTCollator, tokenize_sft
 
 
 class TestSFTCollator:

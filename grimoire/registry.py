@@ -10,7 +10,6 @@ uniform interface across diffusion (Atelier) and LLM (Grimoire) training.
 import importlib
 from typing import Any
 
-
 LOSSES: dict[str, str] = {
     "sft":    "grimoire.losses.sft:SFTLoss",
     "orpo":   "grimoire.losses.orpo:ORPOLoss",

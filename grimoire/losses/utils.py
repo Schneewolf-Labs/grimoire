@@ -123,7 +123,7 @@ def _iter_wrappers(model):
             m = m.get_base_model()
         elif hasattr(m, "_orig_mod"):  # torch.compile
             m = m._orig_mod
-        elif hasattr(m, "module") and isinstance(getattr(m, "module"), torch.nn.Module):  # DDP / FSDP
+        elif hasattr(m, "module") and isinstance(m.module, torch.nn.Module):  # DDP / FSDP
             m = m.module
         else:
             return

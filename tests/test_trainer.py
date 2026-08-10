@@ -8,20 +8,20 @@ import tempfile
 import types
 from contextlib import contextmanager
 
-import torch
-import torch.nn as nn
 import pytest
+import torch
 from datasets import Dataset
+from torch import nn
 
-from grimoire import GrimoireTrainer, TrainingConfig, TrainerCallback
-from grimoire.losses.sft import SFTLoss
-from grimoire.losses.orpo import ORPOLoss
-from grimoire.losses.dpo import DPOLoss
-from grimoire.losses.simpo import SimPOLoss
-from grimoire.losses.kto import KTOLoss
+from grimoire import GrimoireTrainer, TrainerCallback, TrainingConfig
 from grimoire.losses.cpo import CPOLoss
-from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.grpo import GRPOMethod
+from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.kto import KTOLoss
+from grimoire.losses.orpo import ORPOLoss
+from grimoire.losses.sft import SFTLoss
+from grimoire.losses.simpo import SimPOLoss
 
 
 class TinyLM(nn.Module):

@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 
 def get_version():
@@ -50,6 +50,8 @@ setup(
         "logging": ["wandb>=0.15.0"],
         "liger": ["liger-kernel>=0.5.0"],
         "yaml": ["PyYAML>=6.0"],
-        "dev": ["pytest>=7.0", "ruff>=0.1.0", "PyYAML>=6.0"],
+        # ruff is capped: its default rule set grows between minor releases, so an open
+        # bound lets a ruff release turn CI red on a commit nobody made.
+        "dev": ["pytest>=7.0", "ruff>=0.1.0,<0.17", "PyYAML>=6.0"],
     },
 )

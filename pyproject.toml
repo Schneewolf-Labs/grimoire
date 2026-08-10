@@ -6,5 +6,14 @@ build-backend = "setuptools.build_meta"
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.lint.per-file-ignores]
+# Loss functions return (loss, metrics). Tests that assert only on the loss still have to
+# unpack both, and naming the second half `_metrics` everywhere would be noise — the tuple
+# shape is the point.
+"tests/test_losses.py" = ["RUF059"]
+# setup.py execs the version file, which is the standard way to read a version without
+# importing the package at build time.
+"setup.py" = ["S102"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

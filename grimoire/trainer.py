@@ -1,15 +1,16 @@
 import gc
-import os
-import math
 import glob
-import shutil
 import logging
+import math
+import os
+import shutil
 
 import torch
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
 from .config import TrainingConfig
 
 
@@ -59,8 +60,8 @@ class Muon(torch.optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
                  ns_steps=5, adam_optimizer=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
-                        ns_steps=ns_steps)
+        defaults = {"lr": lr, "momentum": momentum, "nesterov": nesterov,
+                    "ns_steps": ns_steps}
         super().__init__(params, defaults)
         self.adam_optimizer = adam_optimizer
 
@@ -226,17 +227,17 @@ class Adafactor(torch.optim.Optimizer):
         scale_parameter=False,
         warmup_init=False,
     ):
-        defaults = dict(
-            lr=lr,
-            eps=eps,
-            clip_threshold=clip_threshold,
-            decay_rate=decay_rate,
-            beta1=beta1,
-            weight_decay=weight_decay,
-            relative_step=relative_step,
-            scale_parameter=scale_parameter,
-            warmup_init=warmup_init,
-        )
+        defaults = {
+            "lr": lr,
+            "eps": eps,
+            "clip_threshold": clip_threshold,
+            "decay_rate": decay_rate,
+            "beta1": beta1,
+            "weight_decay": weight_decay,
+            "relative_step": relative_step,
+            "scale_parameter": scale_parameter,
+            "warmup_init": warmup_init,
+        }
         super().__init__(params, defaults)
 
     @staticmethod
@@ -784,7 +785,9 @@ class GrimoireTrainer:
                 vals = self.accelerator.reduce(vals, reduction="mean")
                 for k, v in zip(keys, vals):
                     total_metrics[k] = total_metrics.get(k, 0.0) + v.item() * batch_samples
-            num_batches += 1
+            # ruff suggests enumerate() here, but num_batches is read after the loop as a
+            # count, and enumerate would make it zero-based on the last iteration.
+            num_batches += 1  # noqa: SIM113
             eval_iter.set_postfix(loss=f"{total_loss / max(total_samples, 1):.4f}")
 
             if num_batches % log_every == 0:
@@ -870,9 +873,10 @@ class GrimoireTrainer:
             return key
 
         try:
-            from safetensors.torch import load_file, save_file
-            from collections import OrderedDict
             import json as _json
+            from collections import OrderedDict
+
+            from safetensors.torch import load_file, save_file
 
             if os.path.exists(index_path):
                 with open(index_path) as f:

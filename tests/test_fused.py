@@ -13,25 +13,25 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
-from grimoire.losses.sft import SFTLoss
-from grimoire.losses.orpo import ORPOLoss
-from grimoire.losses.dpo import DPOLoss
-from grimoire.losses.simpo import SimPOLoss
-from grimoire.losses.kto import KTOLoss
 from grimoire.losses.cpo import CPOLoss
-from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.dpo import DPOLoss
 from grimoire.losses.grpo import GRPOMethod
+from grimoire.losses.ipo import IPOLoss
+from grimoire.losses.kto import KTOLoss
+from grimoire.losses.orpo import ORPOLoss
+from grimoire.losses.sft import SFTLoss
+from grimoire.losses.simpo import SimPOLoss
 from grimoire.losses.utils import _fused_logits_kwarg, forward_per_token_logps
 
 from .test_losses import (
-    SimpleModel,
     MockTokenizer,
-    _make_preference_batch,
-    _make_kto_batch,
-    _make_grpo_batch,
+    SimpleModel,
     _length_reward_fn,
+    _make_grpo_batch,
+    _make_kto_batch,
+    _make_preference_batch,
 )
 
 
@@ -463,6 +463,7 @@ class TestFusedEdgeCases:
         """cache_reference_log_probs goes through the fused path on supported models."""
         from grimoire.data.cache import cache_reference_log_probs
         from grimoire.data.preference import PreferenceCollator
+
         from .test_losses import _make_preference_dataset
 
         torch.manual_seed(0)

@@ -18,7 +18,6 @@ from grimoire.train import (
     load_yaml,
 )
 
-
 # ---- registry ----
 
 class TestRegistry:
