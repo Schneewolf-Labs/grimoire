@@ -18,7 +18,6 @@ import tempfile
 
 import pytest
 import torch
-from datasets import Dataset
 
 from grimoire import GrimoireTrainer, TrainingConfig
 from grimoire.losses.sft import SFTLoss
@@ -37,8 +36,8 @@ class PeftableTinyLM(TinyLM):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        cfg = dict(is_encoder_decoder=False, use_return_dict=True, tie_word_embeddings=False,
-                   model_type="tiny")
+        cfg = {"is_encoder_decoder": False, "use_return_dict": True,
+               "tie_word_embeddings": False, "model_type": "tiny"}
         self.config = type("Config", (), {
             **cfg,
             "get": lambda self, k, d=None: cfg.get(k, d),
@@ -111,7 +110,7 @@ def test_checkpoint_keys_load_without_silent_mismatch():
     tmpdir = tempfile.mkdtemp()
     try:
         _train(tmpdir, epochs=1)
-        ckpt = os.path.join(tmpdir, sorted(os.listdir(tmpdir))[0])
+        ckpt = os.path.join(tmpdir, min(os.listdir(tmpdir)))
 
         state = load_peft_weights(ckpt)
         assert state, "checkpoint produced an empty state dict"
@@ -136,8 +135,8 @@ def test_resume_from_adapter_checkpoint():
     tmpdir = tempfile.mkdtemp()
     try:
         trainer = _train(tmpdir, epochs=1)
-        ckpt = os.path.join(tmpdir, sorted(
-            [d for d in os.listdir(tmpdir) if d.startswith("checkpoint-")])[0])
+        ckpt = os.path.join(tmpdir, min(
+            d for d in os.listdir(tmpdir) if d.startswith("checkpoint-")))
         saved = {k: v.clone() for k, v in trainer.model.state_dict().items() if "lora_B" in k}
         assert any(v.abs().sum() > 0 for v in saved.values()), \
             "training left every lora_B at its zero init — nothing to resume"
@@ -147,8 +146,8 @@ def test_resume_from_adapter_checkpoint():
         resumed = _train(tempfile.mkdtemp(), epochs=1, resume=ckpt, run=False)
         loaded = {k: v for k, v in resumed.model.state_dict().items() if "lora_B" in k}
         assert set(saved) == set(loaded), "resumed model has different adapter tensors"
-        for k in saved:
-            assert torch.allclose(saved[k], loaded[k]), \
+        for k, want in saved.items():
+            assert torch.allclose(want, loaded[k]), \
                 f"{k} was not restored — resume silently started from the initial adapter"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
