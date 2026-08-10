@@ -552,6 +552,9 @@ class GrimoireTrainer:
         if config.neftune_alpha is not None and config.neftune_alpha > 0:
             self._neftune_hook_handle = self._register_neftune_hook(config.neftune_alpha)
 
+        # PEFT runs checkpoint the adapter, not the frozen base model
+        self._register_peft_checkpoint_hooks()
+
         # Resume from checkpoint
         if config.resume_from_checkpoint:
             self.accelerator.load_state(config.resume_from_checkpoint)
@@ -1138,6 +1141,52 @@ class GrimoireTrainer:
         )
 
         return Muon(muon_params, lr=lr, momentum=0.95, adam_optimizer=adam_optimizer)
+
+    def _register_peft_checkpoint_hooks(self):
+        """Make ``accelerator.save_state`` write the adapter instead of the whole model.
+
+        For a LoRA run the base weights are frozen, so a full checkpoint stores tens of
+        gigabytes of tensors that are identical to the ones already on disk — once per epoch.
+        A 12B PEFT run writes ~25 GB per checkpoint to preserve a ~456 MB adapter.
+
+        The hooks also make checkpoints directly loadable with
+        ``PeftModel.from_pretrained(base, "checkpoint-N")``. Pulling adapter tensors out of a
+        full checkpoint by hand is a trap: the live module stores the *active adapter name* in
+        its keys (``lora_A.default.weight``), while ``load_adapter`` inserts the name it is
+        given. Mismatched keys are skipped silently, so a hand-extracted adapter loads at its
+        initial value and evaluates exactly like the base model with no error raised.
+        ``save_pretrained`` writes the normalised names, so this avoids the whole class of
+        problem.
+        """
+        model = self.accelerator.unwrap_model(self.model)
+        if not (hasattr(model, "save_pretrained") and hasattr(model, "peft_config")):
+            return
+
+        def save_hook(models, weights, output_dir):
+            for m in models:
+                unwrapped = self.accelerator.unwrap_model(m)
+                if self.accelerator.is_main_process:
+                    unwrapped.save_pretrained(output_dir)
+            # Drop the full state dicts so accelerate does not write them. This must happen on
+            # every process, not just the main one, or the ranks disagree about what was saved.
+            weights.clear()
+
+        def load_hook(models, input_dir):
+            from peft import load_peft_weights, set_peft_model_state_dict
+
+            while models:
+                m = models.pop()
+                unwrapped = self.accelerator.unwrap_model(m)
+                state = load_peft_weights(input_dir)
+                incompatible = set_peft_model_state_dict(unwrapped, state)
+                unexpected = getattr(incompatible, "unexpected_keys", None)
+                if unexpected:
+                    logger.warning(f"Adapter checkpoint had {len(unexpected)} unexpected keys")
+
+        self.accelerator.register_save_state_pre_hook(save_hook)
+        self.accelerator.register_load_state_pre_hook(load_hook)
+        self._peft_checkpointing = True
+        logger.info("PEFT detected — checkpoints will contain the adapter only")
 
     def _save_checkpoint(self):
         checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{self.global_step}")
