@@ -3,3 +3,4 @@ from .preference import PreferenceCollator as PreferenceCollator, tokenize_prefe
 from .kto import KTOCollator as KTOCollator, tokenize_kto as tokenize_kto
 from .grpo import GRPOCollator as GRPOCollator, tokenize_grpo as tokenize_grpo
 from .cache import cache_reference_log_probs as cache_reference_log_probs
+from .common import truncate_prompt_ids as truncate_prompt_ids, PROMPT_TRUNCATION_MODES as PROMPT_TRUNCATION_MODES

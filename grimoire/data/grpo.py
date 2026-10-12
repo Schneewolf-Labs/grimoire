@@ -1,5 +1,7 @@
 import torch
 
+from .common import truncate_prompt_ids
+
 
 class GRPOCollator:
     """Left-pads prompt-only sequences for online-method training.
@@ -53,6 +55,7 @@ def tokenize_grpo(
     max_prompt_length=512,
     prompt_field="prompt",
     metadata_fields=None,
+    prompt_truncation="keep_end",
 ):
     """Tokenize a prompt for online-method training (no response).
 
@@ -65,6 +68,11 @@ def tokenize_grpo(
     correctness/test-based rewards (expected outputs, test specs) instead of
     smuggling them through the prompt string.
 
+    Over-long prompts keep their end by default (``prompt_truncation=
+    "keep_end"``): the generation header the policy completes sits at the end
+    of a chat-formatted prompt, and right-truncation would cut it off. Pass
+    ``"keep_start"`` for the previous behavior.
+
     Use with dataset.map():
         dataset = dataset.map(
             lambda x: tokenize_grpo(x, tokenizer, max_prompt_length=512,
@@ -74,11 +82,16 @@ def tokenize_grpo(
     """
     prompt = example[prompt_field]
 
-    tokens = tokenizer(prompt, max_length=max_prompt_length, truncation=True)
+    input_ids = truncate_prompt_ids(
+        list(tokenizer(prompt)["input_ids"]),
+        max_prompt_length,
+        mode=prompt_truncation,
+        bos_token_id=getattr(tokenizer, "bos_token_id", None),
+    )
 
     out = {
-        "input_ids": tokens["input_ids"],
-        "attention_mask": tokens["attention_mask"],
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
     }
     for name in metadata_fields or []:
         out[name] = example[name]

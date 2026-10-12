@@ -55,6 +55,7 @@ def tokenize_preference(
     prompt_field="prompt",
     chosen_field="chosen",
     rejected_field="rejected",
+    prompt_truncation="keep_end",
 ):
     """Tokenize a single example for preference training (ORPO/DPO).
 
@@ -62,6 +63,9 @@ def tokenize_preference(
         max_length: Maximum total sequence length (prompt + response).
         max_prompt_length: Maximum prompt length in tokens. Longer prompts are
             truncated so more of the response is preserved for training.
+        prompt_truncation: ``"keep_end"`` (default) keeps the end of an
+            over-long prompt, ``"keep_start"`` its beginning. See
+            :func:`grimoire.data.common.truncate_prompt_ids`.
 
     Use with dataset.map():
         dataset = dataset.map(
@@ -74,10 +78,12 @@ def tokenize_preference(
     chosen = encode_prompt_response(
         tokenizer, prompt, example[chosen_field],
         max_length=max_length, max_prompt_length=max_prompt_length,
+        prompt_truncation=prompt_truncation,
     )
     rejected = encode_prompt_response(
         tokenizer, prompt, example[rejected_field],
         max_length=max_length, max_prompt_length=max_prompt_length,
+        prompt_truncation=prompt_truncation,
     )
 
     return {

@@ -109,6 +109,7 @@ def tokenize_sft(
     text_field=None,
     prompt_field=None,
     response_field=None,
+    prompt_truncation="keep_end",
 ):
     """Tokenize a single example for SFT training.
 
@@ -120,6 +121,9 @@ def tokenize_sft(
         max_length: Maximum total sequence length (prompt + response).
         max_prompt_length: Maximum prompt length in tokens. Longer prompts are
             truncated so more of the response is preserved for training.
+        prompt_truncation: ``"keep_end"`` (default) keeps the end of an
+            over-long prompt, ``"keep_start"`` its beginning. See
+            :func:`grimoire.data.common.truncate_prompt_ids`.
 
     Use with dataset.map():
         dataset = dataset.map(
@@ -142,6 +146,7 @@ def tokenize_sft(
             example[response_field],
             max_length=max_length,
             max_prompt_length=max_prompt_length,
+            prompt_truncation=prompt_truncation,
         )
 
     raise ValueError("Provide either text_field or both prompt_field and response_field")
