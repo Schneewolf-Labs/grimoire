@@ -50,6 +50,7 @@ def tokenize_kto(
     prompt_field="prompt",
     response_field="response",
     label_field="label",
+    prompt_truncation="keep_end",
 ):
     """Tokenize a single example for KTO training.
 
@@ -60,6 +61,9 @@ def tokenize_kto(
         max_length: Maximum total sequence length (prompt + response).
         max_prompt_length: Maximum prompt length in tokens. Longer prompts are
             truncated so more of the response is preserved for training.
+        prompt_truncation: ``"keep_end"`` (default) keeps the end of an
+            over-long prompt, ``"keep_start"`` its beginning. See
+            :func:`grimoire.data.common.truncate_prompt_ids`.
 
     Use with dataset.map():
         dataset = dataset.map(
@@ -73,6 +77,7 @@ def tokenize_kto(
         example[response_field],
         max_length=max_length,
         max_prompt_length=max_prompt_length,
+        prompt_truncation=prompt_truncation,
     )
     encoded["kto_label"] = bool(example[label_field])
     return encoded
