@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from .config import TrainingConfig
+from .attention import enable_chunked_attention
 from .quantized import enable_quantized_backward, fix_lora_dtypes
 
 
@@ -409,6 +410,10 @@ class GrimoireTrainer:
         # bitsandbytes: bnb quantizes linears, Liger patches norms/activations.
         if config.use_liger:
             self._apply_liger_kernel(model)
+
+        # Eager-only attention (DeepSeek-V4) materializes full-sequence logits per layer;
+        # compute it in checkpointed query blocks instead. See grimoire/attention.py.
+        enable_chunked_attention(model)
 
         # Apply PEFT / LoRA
         if peft_config is not None:
