@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- **LoRA on native FP8/FP4 checkpoints.** Models loaded with transformers' fine-grained FP8 quantization (e.g. DeepSeek-V4: FP8 linears, FP4 routed experts) can now be LoRA-trained without dequantizing. The FP8/FP4 kernels have no backward, so `grimoire/quantized.py` wraps each frozen quantized matmul: forward runs the original kernel, backward dequantizes that one weight on the fly to compute the activation gradient. Memory stays at the quantized size. The trainer enables this automatically when such modules are present and moves LoRA weights that PEFT had cast to the FP8 base dtype back to bf16.
+
 ### Changed
 - **4-bit/8-bit QLoRA no longer upcasts embeddings and `lm_head` to fp32 by default.** bitsandbytes only quantizes `nn.Linear` layers — `embed_tokens` and `lm_head` always stay in half precision — and peft's `prepare_model_for_kbit_training` then upcast every one of those non-quantized params to fp32. On a 128k+-vocab model that's ~1B params doubled (≈4 GB of extra VRAM), making 4-bit loads look like the full weights were still resident. The trainer now defaults to a selective prep (`kbit_upcast="norms"` on `TrainingConfig`): only 1-D params (RMSNorm/LayerNorm weights, biases — a few MB) are upcast to fp32 for numerical stability, while embeddings and `lm_head` keep their loaded dtype. Set `kbit_upcast="all"` to restore peft's full-upcast behavior, or `"none"` to skip the upcast entirely.
 
