@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from .config import TrainingConfig
+from .quantized import enable_quantized_backward, fix_lora_dtypes
 
 
 def _newton_schulz_5(G, steps=5):
@@ -415,7 +416,12 @@ class GrimoireTrainer:
 
             if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
                 model = self._prepare_kbit_model(model, config)
+            # Native FP8/FP4 checkpoints (e.g. DeepSeek-V4): backprop through the frozen
+            # quantized kernels instead of dequantizing the model. See grimoire/quantized.py.
+            quantized = enable_quantized_backward(model)
             model = get_peft_model(model, peft_config)
+            if quantized:
+                fix_lora_dtypes(model)
             if hasattr(model, "print_trainable_parameters"):
                 model.print_trainable_parameters()
 
