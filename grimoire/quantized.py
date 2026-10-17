@@ -12,6 +12,12 @@ whose forward is the original kernel and whose backward dequantizes W (one matri
 time, transiently) and computes dx in the gradient's dtype. Memory stays at the quantized
 size; the backward costs one dequant per weight per step.
 
+Routed experts get a grouped path instead of transformers' eager per-expert loop (a few
+hundred small kernel launches per layer, three times per step under checkpointing): pairs
+are sorted by expert, the forward is one fused grouped matmul per projection, and the
+backward dequantizes ``_EXPERT_CHUNK`` experts at a time and runs one grouped bf16 matmul
+per chunk.
+
 PEFT also casts each adapter to its base layer's dtype when the base is floating point,
 and float8 counts, so LoRA weights on an FP8 linear would be created in FP8.
 ``fix_lora_dtypes`` moves them back to bf16 and re-initializes them.
@@ -29,6 +35,8 @@ _FP4_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.
 _QUANT_LINEARS = ("FP8Linear",)
 _QUANT_GROUPED = ("FP8GroupedLinear",)
 _QUANT_EXPERTS = ("FP8Experts",)
+_EXPERT_CHUNK = 32           # experts dequantized together in the grouped path (~1.6 GB bf16 on DSV4-Flash)
+_state = {"kernel": True, "grouped_mm": True}
 
 
 def _fp8_dtypes() -> tuple:
@@ -99,6 +107,109 @@ class _FrozenQuantGrouped(torch.autograd.Function):
         return torch.einsum("...go,goi->...gi", grad_out, w), None, None, None, None
 
 
+def _grouped_dense(x, weight, scale, counts, transpose):
+    """Per-expert matmul over expert-sorted rows of ``x`` against dequantized expert weights.
+
+    ``counts[e]`` rows belong to expert ``e``. ``transpose=True``: x_e @ W_e^T (forward);
+    ``False``: x_e @ W_e (input gradient). Only experts with rows are dequantized, in chunks.
+    """
+    rows = weight.shape[-2]
+    cols = weight.shape[-1] * (2 if weight.dtype in (torch.int8, torch.uint8) else 1)
+    out = x.new_empty(x.shape[0], rows if transpose else cols)
+    hit = [e for e, c in enumerate(counts) if c]
+    starts, pos = {}, 0
+    for e, c in enumerate(counts):
+        starts[e] = pos
+        pos += c
+    for i in range(0, len(hit), _EXPERT_CHUNK):
+        idx = hit[i:i + _EXPERT_CHUNK]
+        sel = torch.tensor(idx, device=weight.device)
+        w = dequantize(weight.index_select(0, sel), scale.index_select(0, sel), x.dtype)   # (c, rows, cols)
+        lo, hi = starts[idx[0]], starts[idx[-1]] + counts[idx[-1]]
+        if _state["grouped_mm"] and x.is_cuda and hasattr(torch, "_grouped_mm"):
+            try:
+                offs = torch.tensor([counts[e] for e in idx], device=x.device).cumsum(0).to(torch.int32)
+                b = w.transpose(-2, -1) if transpose else w
+                out[lo:hi] = torch._grouped_mm(x[lo:hi].contiguous(), b, offs=offs)
+                continue
+            except (RuntimeError, TypeError, NotImplementedError) as e:
+                _state["grouped_mm"] = False
+                logger.warning(f"torch._grouped_mm unavailable ({e}); using a per-expert loop")
+        for j, e in enumerate(idx):
+            a, b = starts[e], starts[e] + counts[e]
+            out[a:b] = x[a:b] @ (w[j].T if transpose else w[j])
+    return out
+
+
+class _FrozenQuantExperts(torch.autograd.Function):
+    """Grouped expert projection on expert-sorted rows; dx = per-expert dy @ dequant(W_e)."""
+
+    @staticmethod
+    def forward(ctx, x, weight, scale, counts, matmul):
+        ctx.save_for_backward(weight, scale)
+        ctx.counts = counts
+        with torch.no_grad():
+            return matmul(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        weight, scale = ctx.saved_tensors
+        return _grouped_dense(grad_out.contiguous(), weight, scale, ctx.counts, transpose=False), None, None, None, None
+
+
+def _expert_matmul(module, weight, scale, counts, counts_t):
+    """Forward matmul for one expert projection: the fused FP8/FP4 kernel on GPU, else dequant."""
+    dense = lambda x: _grouped_dense(x, weight, scale, counts, transpose=True)  # noqa: E731
+    if not (_state["kernel"] and weight.is_cuda):
+        return dense
+    if torch.cuda.get_device_capability(weight.device)[0] >= 10:
+        # The hub kernel's Blackwell (SM100) grouped MXFP path hits "misaligned address" on long
+        # batches (seen on B200, 6k-token rows); a sticky CUDA error, so it can't be caught and
+        # retried. Use dequant + grouped matmul there.
+        return dense
+    try:
+        from transformers.integrations.finegrained_fp8 import load_finegrained_fp8_kernel
+        kernel = load_finegrained_fp8_kernel()
+    except Exception as e:
+        _state["kernel"] = False
+        logger.warning(f"Fine-grained FP8 kernel unavailable ({e}); experts use dequant + grouped matmul")
+        return dense
+    tokens_per_expert = counts_t.to(torch.int32)
+    offsets = torch.cumsum(tokens_per_expert, 0, dtype=torch.int32)
+
+    def fused(x):
+        try:
+            return kernel.grouped_matmul(x, weight, scale, offsets=offsets, tokens_per_expert=tokens_per_expert,
+                                         block_size=getattr(module, "block_size", None))
+        except Exception as e:
+            _state["kernel"] = False
+            logger.warning(f"Fused grouped FP8/FP4 matmul failed ({e}); experts use dequant + grouped matmul")
+            return dense(x)
+    return fused
+
+
+def _grouped_experts_forward(module, hidden_states, top_k_index, top_k_weights):
+    num_tokens, hidden = hidden_states.shape
+    top_k = top_k_index.size(-1)
+    expert_ids, perm = torch.sort(top_k_index.reshape(-1), stable=True)
+    counts_t = torch.bincount(expert_ids, minlength=module.num_experts)
+    counts = counts_t.tolist()
+    x = hidden_states[perm // top_k]
+
+    if module.has_gate:
+        w_up, s_up = module.gate_up_proj.detach(), module.gate_up_proj_scale_inv.detach()
+    else:
+        w_up, s_up = module.up_proj.detach(), module.up_proj_scale_inv.detach()
+    h = _FrozenQuantExperts.apply(x, w_up, s_up, counts, _expert_matmul(module, w_up, s_up, counts, counts_t))
+    h = module._apply_gate(h) if module.has_gate else module.act_fn(h)
+    w_dn, s_dn = module.down_proj.detach(), module.down_proj_scale_inv.detach()
+    y = _FrozenQuantExperts.apply(h, w_dn, s_dn, counts, _expert_matmul(module, w_dn, s_dn, counts, counts_t))
+
+    y = y.float() * top_k_weights.reshape(-1)[perm].float().unsqueeze(-1)
+    out = torch.zeros(num_tokens * top_k, hidden, dtype=y.dtype, device=y.device).index_copy(0, perm, y)
+    return out.view(num_tokens, top_k, hidden).sum(dim=1).to(hidden_states.dtype)
+
+
 def _wrap_linear(module):
     original = module.forward
 
@@ -133,12 +244,26 @@ def _wrap_experts(module):
 
     module.linear = linear
 
+    if not all(hasattr(module, a) for a in ("down_proj", "down_proj_scale_inv", "num_experts", "has_gate")):
+        return
+    original_forward = module.forward
+
+    def forward(hidden_states, top_k_index, top_k_weights):
+        if (not is_quantized_weight(module.down_proj) or getattr(module, "activation_scheme", "dynamic") != "dynamic"
+                or getattr(module, "_is_expert_parallel", False)):
+            return original_forward(hidden_states, top_k_index, top_k_weights)
+        return _grouped_experts_forward(module, hidden_states, top_k_index, top_k_weights)
+
+    module.forward = forward
+
 
 def enable_quantized_backward(model: torch.nn.Module) -> int:
     """Make the frozen quantized modules of ``model`` pass activation gradients. Returns how many.
 
-    Experts must run transformers' eager per-expert loop (the one that calls ``linear``);
-    the fused batched/grouped/DeepGEMM expert paths are switched off when present.
+    Experts with the standard fused layout (``gate_up_proj``/``down_proj`` + scales) get
+    grimoire's grouped path; anything else falls back to transformers' eager per-expert
+    loop (the one that calls ``linear``), so the model's experts implementation is set to
+    eager for that fallback.
     """
     count = 0
     for module in model.modules():

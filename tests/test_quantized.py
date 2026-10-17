@@ -79,7 +79,9 @@ class FP8Experts(nn.Module):
 
 def test_fp4_dequant_matches_transformers():
     tr = pytest.importorskip("transformers.integrations.finegrained_fp8")
-    if not hasattr(getattr(tr, "Fp8Dequantize", None), "_dequantize_one"):
+    import inspect
+    fn = getattr(getattr(tr, "Fp8Dequantize", None), "_dequantize_one", None)
+    if fn is None or "output_dtype" not in inspect.signature(fn).parameters:
         pytest.skip("transformers without FP4-aware Fp8Dequantize (5.20+)")
     w = torch.randn(4, 16)
     packed, scale = quantize_fp4(w)
@@ -147,3 +149,70 @@ def test_lora_on_fp8_base_trains_in_bf16():
     model(torch.randn(4, 8, dtype=dtype)).float().pow(2).sum().backward()
     grads = {n for n, p in model.named_parameters() if p.grad is not None}
     assert grads and all("lora_" in n for n in grads)
+
+
+class FP8GatedExperts(FP8Experts):
+    """transformers' fused FP4 experts layout: gate_up_proj (E, 2I, H), down_proj (E, H, I), eager loop."""
+
+    def __init__(self, n_experts=6, hidden=8, inter=8):
+        nn.Module.__init__(self)
+        self.num_experts, self.has_gate, self.block_size, self.activation_scheme = n_experts, True, None, "dynamic"
+        self.act_fn = nn.functional.silu
+        up = [quantize_fp4(torch.randn(2 * inter, hidden)) for _ in range(n_experts)]
+        down = [quantize_fp4(torch.randn(hidden, inter)) for _ in range(n_experts)]
+        self.gate_up_proj = nn.Parameter(torch.stack([p for p, _ in up]), requires_grad=False)
+        self.gate_up_proj_scale_inv = nn.Parameter(torch.stack([s for _, s in up]), requires_grad=False)
+        self.down_proj = nn.Parameter(torch.stack([p for p, _ in down]), requires_grad=False)
+        self.down_proj_scale_inv = nn.Parameter(torch.stack([s for _, s in down]), requires_grad=False)
+
+    def _apply_gate(self, gate_up):
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.act_fn(gate) * up
+
+    def linear(self, input, weight, weight_scale_inv, activation_scale=None):
+        with torch.no_grad():
+            return input @ dequantize(weight, weight_scale_inv, input.dtype).T
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        out = torch.zeros_like(hidden_states)
+        for e in range(self.num_experts):
+            tok, pos = torch.where(top_k_index == e)
+            if len(tok) == 0:
+                continue
+            h = self._apply_gate(self.linear(hidden_states[tok], self.gate_up_proj[e], self.gate_up_proj_scale_inv[e]))
+            h = self.linear(h, self.down_proj[e], self.down_proj_scale_inv[e])
+            out.index_add_(0, tok, h * top_k_weights[tok, pos, None])
+        return out
+
+    def dense(self, x, top_k_index, top_k_weights):
+        out = torch.zeros_like(x)
+        for e in range(self.num_experts):
+            tok, pos = torch.where(top_k_index == e)
+            gu = dequantize(self.gate_up_proj[e], self.gate_up_proj_scale_inv[e], x.dtype)
+            dn = dequantize(self.down_proj[e], self.down_proj_scale_inv[e], x.dtype)
+            out = out.index_add(0, tok, (self._apply_gate(x[tok] @ gu.T) @ dn.T) * top_k_weights[tok, pos, None])
+        return out
+
+
+def test_grouped_experts_match_eager_and_dense_grads(monkeypatch):
+    import grimoire.quantized as q
+    monkeypatch.setattr(q, "_EXPERT_CHUNK", 2)                  # several chunks, some with gaps
+    torch.manual_seed(0)
+    exp = FP8GatedExperts()
+    x = torch.randn(5, 8)
+    idx = torch.tensor([[0, 2], [2, 4], [4, 0], [0, 2], [5, 2]])  # experts 1 and 3 never hit
+    wts = torch.softmax(torch.randn(5, 2), -1)
+
+    eager = exp(x, idx, wts)
+    assert enable_quantized_backward(exp) == 1
+    xg = x.clone().requires_grad_(True)
+    grouped = exp(xg, idx, wts)
+    assert torch.allclose(grouped, eager, atol=1e-5, rtol=1e-4)
+
+    grouped.pow(2).sum().backward()
+    xr = x.clone().requires_grad_(True)
+    exp.dense(xr, idx, wts).pow(2).sum().backward()
+    assert torch.allclose(xg.grad, xr.grad, atol=1e-4, rtol=1e-4)
+
+    with torch.no_grad():
+        assert torch.allclose(exp(x, idx, wts), eager, atol=1e-5, rtol=1e-4)
