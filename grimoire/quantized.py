@@ -162,6 +162,11 @@ def _expert_matmul(module, weight, scale, counts, counts_t):
     dense = lambda x: _grouped_dense(x, weight, scale, counts, transpose=True)  # noqa: E731
     if not (_state["kernel"] and weight.is_cuda):
         return dense
+    if torch.cuda.get_device_capability(weight.device)[0] >= 10:
+        # The hub kernel's Blackwell (SM100) grouped MXFP path hits "misaligned address" on long
+        # batches (seen on B200, 6k-token rows); a sticky CUDA error, so it can't be caught and
+        # retried. Use dequant + grouped matmul there.
+        return dense
     try:
         from transformers.integrations.finegrained_fp8 import load_finegrained_fp8_kernel
         kernel = load_finegrained_fp8_kernel()
