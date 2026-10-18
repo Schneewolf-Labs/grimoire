@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-10-18
+
+### Fixed
+- **Fused log-probs no longer keep every layer's hidden states.** The fused path read the final hidden state via `output_hidden_states=True`, which keeps all layers' states alive; under accelerate's mixed precision they are also copied to fp32. On DeepSeek-V4 (4 hyper-connection streams, 44 layers) that ran 2xH200 out of memory on ~7k-token DPO pairs. The decoder's final state is now captured with a forward hook, falling back to `output_hidden_states` for models without `get_decoder()` (#51).
+
 ## [2.1.1] - 2026-10-18
 
 ### Fixed
