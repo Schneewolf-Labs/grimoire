@@ -281,12 +281,14 @@ def fused_per_token_logps(hidden_states, lm_head, labels, label_pad_token_id=-10
 
     def compute_chunk(h, y):
         logits = _head_logits(h, lm_head, logit_transform)  # [chunk, vocab] — the only logits ever created
-        y = y.unsqueeze(1).clamp(max=logits.size(-1) - 1)
+        # Under a multi-GPU device_map the head can sit on another device than the
+        # hidden states; gather there and move only the per-token values back.
+        y = y.to(logits.device).unsqueeze(1).clamp(max=logits.size(-1) - 1)
         if logits.dtype in (torch.float32, torch.float64):
             gathered = torch.gather(logits, 1, y).squeeze(1)
-            return gathered - torch.logsumexp(logits, dim=-1)
+            return (gathered - torch.logsumexp(logits, dim=-1)).to(h.device)
         # bf16 / fp16: F.log_softmax upcasts internally for stability
-        return torch.gather(F.log_softmax(logits, dim=-1), 1, y).squeeze(1)
+        return torch.gather(F.log_softmax(logits, dim=-1), 1, y).squeeze(1).to(h.device)
 
     needs_grad = torch.is_grad_enabled() and (
         sel_hidden.requires_grad or any(p.requires_grad for p in lm_head.parameters())
@@ -329,6 +331,7 @@ def _fused_parity_ok(model_logits, hidden_states, lm_head, logit_transform):
         expected = model_logits.reshape(batch, -1, model_logits.size(-1))[:, -1, :]
         replayed = _head_logits(hidden_states[:, -1:, :].detach(), lm_head, logit_transform)
         replayed = replayed.reshape(batch, -1)
+        expected = expected.to(replayed.device)
         # Generous enough for kernel/dtype variance; a missing softcap or
         # logit scale diverges by orders of magnitude more than this.
         ok = torch.allclose(replayed.float(), expected.float(), rtol=2e-2, atol=0.5)
