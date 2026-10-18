@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-10-18
+
+### Fixed
+- **Fused log-probs on multi-GPU `device_map` after 2.1.2.** The decoder hook added in 2.1.2 returned the final hidden state on the decoder's own device (the last GPU) while labels stay on the input device, so the label gather failed with `indices should be either on cpu or on the same device as the indexed tensor`. The captured state is moved to the input device, as `output_hidden_states` was (#52). 2.1.2 users with models split across GPUs should upgrade.
+
 ## [2.1.2] - 2026-10-18
 
 ### Fixed
