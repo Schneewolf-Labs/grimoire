@@ -384,7 +384,10 @@ def forward_per_token_logps(model, input_ids, attention_mask, labels,
                 outputs = model(**forward_kwargs, **{logits_kwarg: 1})
             finally:
                 handle.remove()
-            hidden_states = captured[-1]
+            # The hook sees the decoder's own device; under a multi-GPU device_map
+            # that is the last GPU, while labels stay on the input device (where
+            # accelerate returns model outputs). Match output_hidden_states.
+            hidden_states = captured[-1].to(input_ids.device)
         else:
             outputs = model(**forward_kwargs, output_hidden_states=True, **{logits_kwarg: 1})
             hidden_states = outputs.hidden_states[-1]
