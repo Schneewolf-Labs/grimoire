@@ -63,3 +63,31 @@ def test_fused_path_does_not_request_all_hidden_states():
         ref, _ = forward_per_token_logps(model, ids, torch.ones_like(ids), labels, fused=False)
     assert not any(seen["ohs"])
     assert torch.allclose(fused[mask], ref[mask], atol=1e-5)
+
+
+@needs_cuda
+def test_fused_logps_with_decoder_output_on_other_device_than_inputs():
+    """Inputs on cuda:0, decoder output elsewhere (as with the last GPU of a device_map): the
+    captured final state must follow the inputs, like output_hidden_states does."""
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(vocab_size=320, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                                         num_attention_heads=4, num_key_value_heads=2)).cuda().eval()
+    ids = torch.randint(0, 320, (2, 24), device="cuda")
+    labels = ids.clone()
+    labels[:, :10] = -100
+    with torch.no_grad():
+        ref, mask = forward_per_token_logps(model, ids, torch.ones_like(ids), labels, fused=False)
+
+    def to_cpu(_m, _a, out):
+        out.last_hidden_state = out.last_hidden_state.cpu()
+        return out
+
+    model.model.register_forward_hook(to_cpu)          # decoder "ends" on another device
+    add_hook_to_module(model.lm_head, AlignDevicesHook(execution_device=torch.device("cuda:0")))
+    with torch.no_grad():
+        out, _ = forward_per_token_logps(model, ids, torch.ones_like(ids), labels, fused=True)
+    assert out.device == ids.device
+    assert torch.allclose(out[mask], ref[mask], atol=1e-4)
