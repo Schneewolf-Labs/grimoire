@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-10-18
+
+### Fixed
+- **Fused log-probs on multi-GPU `device_map`.** When a model is split across GPUs (e.g. `device_map="auto"`), its outputs return on the input device while the lm_head runs on the last GPU. The fused path's parity check and per-chunk label gather then mixed tensors from two devices and raised `Expected all tensors to be on the same device`, so DPO/SFT with `fused=True` failed on the first batch. Labels are now gathered on the head's device and only the per-token values move back (#50).
+
 ## [2.1.0] - 2026-10-17
 
 ### Added
