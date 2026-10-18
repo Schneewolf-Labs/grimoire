@@ -368,8 +368,26 @@ def forward_per_token_logps(model, input_ids, attention_mask, labels,
     if fused and model not in _parity_failed:
         logits_kwarg = _fused_logits_kwarg(model)
     if logits_kwarg is not None:
-        outputs = model(**forward_kwargs, output_hidden_states=True, **{logits_kwarg: 1})
-        hidden_states = outputs.hidden_states[-1]
+        decoder = _final_hidden_source(model)
+        if decoder is not None:
+            # Capture only the decoder's final hidden state. output_hidden_states=True
+            # would keep every layer's states (several per layer on hyper-connection
+            # models like DeepSeek-V4), and accelerate's mixed-precision output
+            # conversion then copies all of them to fp32 — tens of GB on long rows.
+            captured = []
+
+            def _grab(_module, _args, out):
+                captured.append(out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0])
+
+            handle = decoder.register_forward_hook(_grab)
+            try:
+                outputs = model(**forward_kwargs, **{logits_kwarg: 1})
+            finally:
+                handle.remove()
+            hidden_states = captured[-1]
+        else:
+            outputs = model(**forward_kwargs, output_hidden_states=True, **{logits_kwarg: 1})
+            hidden_states = outputs.hidden_states[-1]
         lm_head = _unwrap_model(model).get_output_embeddings()
         logit_transform = _logit_transform(model)
 
@@ -393,6 +411,21 @@ def forward_per_token_logps(model, input_ids, attention_mask, labels,
 
     logits = model(**forward_kwargs).logits
     return per_token_logps_from_logits(logits, labels, label_pad_token_id)
+
+
+def _final_hidden_source(model):
+    """The decoder module whose output (``last_hidden_state``) feeds the lm_head, or None."""
+    base = _unwrap_model(model)
+    get_decoder = getattr(base, "get_decoder", None)
+    if get_decoder is None:
+        return None
+    try:
+        decoder = get_decoder()
+    except Exception:
+        return None
+    if not isinstance(decoder, torch.nn.Module) or decoder is base:
+        return None
+    return decoder
 
 
 def _add_weak(weak_set, model):
