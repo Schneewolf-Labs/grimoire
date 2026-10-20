@@ -5,6 +5,7 @@ from grimoire.data.sft import SFTCollator, PackedSFTCollator, tokenize_sft
 from grimoire.data.preference import PreferenceCollator, tokenize_preference
 from grimoire.data.kto import KTOCollator, tokenize_kto
 from grimoire.data.grpo import GRPOCollator, tokenize_grpo
+from grimoire.data.common import truncate_prompt_ids
 
 
 class TestSFTCollator:
@@ -512,15 +513,25 @@ class TestTokenizePreferenceCustomFields:
         assert result["rejected_labels"][:2] == [-100, -100]
 
     def test_max_prompt_length_truncates_prompt(self, mock_tokenizer):
-        # prompt = "ABCD" (4 chars), max_prompt_length=2 → prompt truncated to "AB"
+        # prompt = "ABCD" (4 chars), max_prompt_length=2 → the END survives: "CD"
         example = {"prompt": "ABCD", "chosen": "EF", "rejected": "GH"}
         result = tokenize_preference(
             example, mock_tokenizer, max_prompt_length=2
         )
 
-        assert result["chosen_input_ids"] == [ord("A"), ord("B"), ord("E"), ord("F")]
+        assert result["chosen_input_ids"] == [ord("C"), ord("D"), ord("E"), ord("F")]
+        assert result["rejected_input_ids"] == [ord("C"), ord("D"), ord("G"), ord("H")]
         assert result["chosen_labels"][:2] == [-100, -100]
         assert result["chosen_labels"][2:] == [ord("E"), ord("F")]
+
+    def test_keep_start_restores_previous_behavior(self, mock_tokenizer):
+        example = {"prompt": "ABCD", "chosen": "EF", "rejected": "GH"}
+        result = tokenize_preference(
+            example, mock_tokenizer, max_prompt_length=2, prompt_truncation="keep_start"
+        )
+
+        assert result["chosen_input_ids"] == [ord("A"), ord("B"), ord("E"), ord("F")]
+        assert result["rejected_input_ids"] == [ord("A"), ord("B"), ord("G"), ord("H")]
 
     def test_truncates_to_max_length(self, mock_tokenizer):
         example = {"prompt": "AB", "chosen": "CDEFGHIJ", "rejected": "KLMNOPQR"}
@@ -618,3 +629,90 @@ class TestTokenizeGRPO:
         result = tokenize_grpo(example, mock_tokenizer)
 
         assert set(result) == {"input_ids", "attention_mask"}
+
+
+class TestPromptTruncation:
+    """Over-long prompts keep their END by default.
+
+    For chat/agent data the end of the prompt is what the response answers:
+    the latest user turn, tool results and the assistant generation header.
+    Right-truncation kept the system prompt and threw all of that away.
+    """
+
+    class CharTokenizer:
+        """One token per char; optional BOS prepended on add_special_tokens."""
+
+        def __init__(self, bos_token_id=None):
+            self.bos_token_id = bos_token_id
+
+        def __call__(self, text, max_length=None, truncation=False, add_special_tokens=True):
+            ids = [ord(c) for c in text]
+            if add_special_tokens and self.bos_token_id is not None:
+                ids = [self.bos_token_id] + ids
+            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    def test_truncate_prompt_ids_keep_end(self):
+        assert truncate_prompt_ids([1, 2, 3, 4, 5], 2) == [4, 5]
+
+    def test_truncate_prompt_ids_keep_start(self):
+        assert truncate_prompt_ids([1, 2, 3, 4, 5], 2, mode="keep_start") == [1, 2]
+
+    def test_truncate_prompt_ids_noop_when_short_or_unset(self):
+        assert truncate_prompt_ids([1, 2, 3], 3) == [1, 2, 3]
+        assert truncate_prompt_ids([1, 2, 3], None) == [1, 2, 3]
+
+    def test_truncate_prompt_ids_preserves_leading_bos(self):
+        assert truncate_prompt_ids([0, 1, 2, 3, 4], 3, bos_token_id=0) == [0, 3, 4]
+
+    def test_truncate_prompt_ids_bos_only_kept_when_present(self):
+        assert truncate_prompt_ids([1, 2, 3, 4], 2, bos_token_id=0) == [3, 4]
+
+    def test_truncate_prompt_ids_budget_of_one_keeps_last_token(self):
+        assert truncate_prompt_ids([0, 1, 2, 3], 1, bos_token_id=0) == [3]
+
+    def test_truncate_prompt_ids_rejects_unknown_mode(self):
+        with pytest.raises(ValueError, match="prompt_truncation"):
+            truncate_prompt_ids([1, 2, 3], 2, mode="middle")
+
+    def test_chat_prompt_keeps_final_turn_and_generation_header(self):
+        prompt = "<sys>rules</sys><user>question?</user><asst>"
+        example = {"prompt": prompt, "response": "answer"}
+        budget = len("<user>question?</user><asst>")
+        result = tokenize_sft(
+            example, self.CharTokenizer(), max_prompt_length=budget,
+            prompt_field="prompt", response_field="response",
+        )
+
+        text = "".join(chr(i) for i in result["input_ids"])
+        assert text == "<user>question?</user><asst>answer"
+        assert result["labels"][:budget] == [-100] * budget
+
+    def test_sft_keep_end_preserves_bos(self):
+        example = {"prompt": "ABCDEF", "response": "XY"}
+        result = tokenize_sft(
+            example, self.CharTokenizer(bos_token_id=1), max_prompt_length=3,
+            prompt_field="prompt", response_field="response",
+        )
+
+        assert result["input_ids"] == [1, ord("E"), ord("F"), ord("X"), ord("Y")]
+        assert result["labels"] == [-100, -100, -100, ord("X"), ord("Y")]
+
+    def test_kto_keeps_prompt_end(self):
+        example = {"prompt": "ABCDEF", "response": "XY", "label": True}
+        result = tokenize_kto(example, self.CharTokenizer(), max_prompt_length=2)
+
+        assert result["input_ids"] == [ord("E"), ord("F"), ord("X"), ord("Y")]
+        assert result["kto_label"] is True
+
+    def test_grpo_keeps_prompt_end(self):
+        result = tokenize_grpo({"prompt": "ABCDEF"}, self.CharTokenizer(bos_token_id=1),
+                               max_prompt_length=3)
+
+        assert result["input_ids"] == [1, ord("E"), ord("F")]
+        assert result["attention_mask"] == [1, 1, 1]
+
+    def test_grpo_keep_start(self):
+        result = tokenize_grpo({"prompt": "ABCDEF"}, self.CharTokenizer(),
+                               max_prompt_length=3, prompt_truncation="keep_start")
+
+        assert result["input_ids"] == [ord("A"), ord("B"), ord("C")]
